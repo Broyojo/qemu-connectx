@@ -1,0 +1,28 @@
+#!/bin/sh
+# Guest init: bring up just enough to load mlx5_core and run a test script.
+export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+mkdir -p /dev/pts /sys/kernel/debug /run/netns /var/run /var/log
+ln -sfn /run/netns /var/run/netns
+mount -t devpts devpts /dev/pts
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+ip link set lo up
+
+# "mlx5dbg" on the kernel command line turns on the driver's debug prints.
+if grep -qw mlx5dbg /proc/cmdline; then
+    modprobe mlx5_core dyndbg=+p
+else
+    modprobe mlx5_core
+fi
+for m in af_packet 8021q veth; do
+    modprobe $m 2>/dev/null
+done
+
+if [ -x /test/run.sh ]; then
+    /test/run.sh
+    echo "TEST-EXIT: $?"
+    grep -qw keepalive /proc/cmdline || poweroff -f
+fi
+exec setsid sh -c 'exec sh </dev/ttyAMA0 >/dev/ttyAMA0 2>&1'

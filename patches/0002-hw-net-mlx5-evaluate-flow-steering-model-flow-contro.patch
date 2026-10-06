@@ -1,0 +1,1995 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Broyojo <dha@xoba.com>
+Date: Tue, 6 Oct 2026 15:29:42 -0400
+Subject: [PATCH 2/3] hw/net/mlx5: evaluate flow steering, model flow control,
+ stamp at the MAC
+
+Receive flow steering: keep the flow tables, groups and entries the
+driver programs and classify every received frame against them, starting
+at the root table and following forward and miss chains.  TIRs select the
+receive queue, through an RQ table indexed by a Toeplitz (optionally
+symmetric) or XOR8 hash of the fields the TIR selects.  This makes MAC and
+VLAN filtering, promiscuous mode, ethtool flow rules and RSS configuration
+behave as on hardware, and reports the real hash and flow tag in
+completions.
+
+Flow control: with global pause enabled (the default, as on hardware), a
+frame that finds its receive queue empty is left with the network backend
+and retried instead of dropped, and a port stops transmitting while its
+link partner cannot take frames.  The emulated link has no speed limit of
+its own, so without this a sender easily overruns the receiver.
+
+Timestamps: take the transmit timestamp when the frame is handed to the
+backend and the receive timestamp on arrival, before classification and
+copying, as a MAC would.  Between two back-to-back ports this brings the
+gap down from tens of microseconds to a few.
+
+Receive checksum flags now reflect actual verification of the IPv4 header
+and TCP/UDP checksums.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DntkPG3Xz6WwgDaRoET5gX
+---
+ hw/net/meson.build     |   1 +
+ hw/net/mlx5/mlx5.c     |  30 ++
+ hw/net/mlx5/mlx5.h     | 106 ++++++-
+ hw/net/mlx5/mlx5_cmd.c | 185 +++++------
+ hw/net/mlx5/mlx5_dp.c  | 299 ++++++++++++------
+ hw/net/mlx5/mlx5_fs.c  | 673 +++++++++++++++++++++++++++++++++++++++++
+ hw/net/mlx5/mlx5_hw.h  |  15 +
+ hw/net/trace-events    |   8 +
+ 8 files changed, 1112 insertions(+), 205 deletions(-)
+ create mode 100644 hw/net/mlx5/mlx5_fs.c
+
+diff --git a/hw/net/meson.build b/hw/net/meson.build
+index b2766a6..66116c1 100644
+--- a/hw/net/meson.build
++++ b/hw/net/meson.build
+@@ -63,6 +63,7 @@ system_ss.add(when: 'CONFIG_MLX5', if_true: files(
+   'mlx5/mlx5.c',
+   'mlx5/mlx5_cmd.c',
+   'mlx5/mlx5_dp.c',
++  'mlx5/mlx5_fs.c',
+ ))
+ 
+ system_ss.add(when: 'CONFIG_ROCKER', if_true: files(
+diff --git a/hw/net/mlx5/mlx5.c b/hw/net/mlx5/mlx5.c
+index fc79429..9f96281 100644
+--- a/hw/net/mlx5/mlx5.c
++++ b/hw/net/mlx5/mlx5.c
+@@ -90,9 +90,25 @@ MemTxResult mlx5_buf_rw(MLX5State *s, const MLX5Buf *buf, uint64_t off,
+     return MEMTX_OK;
+ }
+ 
++static void mlx5_rx_retry_timer(void *opaque)
++{
++    mlx5_rx_retry(opaque);
++}
++
++static void mlx5_tx_retry_timer(void *opaque)
++{
++    mlx5_tx_resume(opaque);
++}
++
+ static void mlx5_reset(MLX5State *s)
+ {
+     mlx5_cmd_reset(s);
++    timer_del(s->tx_retry_timer);
++    s->tx_paused = false;
++    /* Frames held back for a stalled receive queue are dropped now. */
++    timer_del(s->rx_retry_timer);
++    s->rx_stalled = false;
++    qemu_flush_queued_packets(qemu_get_queue(s->nic));
+     s->cmdq_addr = 0;
+     s->nic_ifc = MLX5_NIC_IFC_FULL;
+     s->db_latch = 0;
+@@ -184,6 +200,14 @@ static void mlx5_uar_write(MLX5State *s, hwaddr addr, uint64_t val,
+ {
+     hwaddr off = addr & (MLX5_UAR_PAGE_SIZE - 1);
+ 
++    /*
++     * The driver refills receive queues without telling the device, but
++     * it rings some doorbell soon after: a good moment to retry.
++     */
++    if (s->rx_stalled) {
++        mlx5_rx_retry(s);
++    }
++
+     if (size == 4) {
+         if (off == MLX5_UAR_EQ_DOORBELL_ARM || off == MLX5_UAR_EQ_DOORBELL) {
+             mlx5_eq_doorbell(s, val, off == MLX5_UAR_EQ_DOORBELL_ARM);
+@@ -322,6 +346,10 @@ static void mlx5_realize(PCIDevice *pci_dev, Error **errp)
+                           DEVICE(s)->id, &DEVICE(s)->mem_reentrancy_guard, s);
+     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+ 
++    s->rx_retry_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mlx5_rx_retry_timer,
++                                     s);
++    s->tx_retry_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mlx5_tx_retry_timer,
++                                     s);
+     s->tx_buf = g_malloc(MLX5_MAX_TX_PKT);
+     s->seg_buf = g_malloc(MLX5_MAX_LSO_HEADER + UINT16_MAX);
+     s->rx_buf = g_malloc(MLX5_MAX_FRAME);
+@@ -332,6 +360,8 @@ static void mlx5_exit(PCIDevice *pci_dev)
+ {
+     MLX5State *s = MLX5(pci_dev);
+ 
++    timer_free(s->rx_retry_timer);
++    timer_free(s->tx_retry_timer);
+     mlx5_cmd_cleanup(s);
+     g_free(s->tx_buf);
+     g_free(s->seg_buf);
+diff --git a/hw/net/mlx5/mlx5.h b/hw/net/mlx5/mlx5.h
+index 7304a72..15f8540 100644
+--- a/hw/net/mlx5/mlx5.h
++++ b/hw/net/mlx5/mlx5.h
+@@ -27,6 +27,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(MLX5State, MLX5)
+ #define MLX5_CMD_MAX_LEN            (4 * MiB)
+ 
+ #define MLX5_MAX_EQS                64
++
++/*
++ * With flow control on, a frame that finds its receive queue empty is held
++ * back and retried, as if the port had paused its link partner.  After this
++ * long without buffers the port gives up and drops instead.  A port whose
++ * link partner cannot take frames stops sending and checks again later.
++ */
++#define MLX5_RX_STALL_NS            (500 * SCALE_MS)
++#define MLX5_RX_RETRY_NS            (100 * SCALE_US)
+ /* Port MTU as the driver counts it: including the Ethernet header and FCS. */
+ #define MLX5_MAX_MTU                10240
+ #define MLX5_MAX_FRAME              MLX5_MAX_MTU
+@@ -94,6 +103,42 @@ typedef struct MLX5Rqt {
+     uint32_t *rqns;
+ } MLX5Rqt;
+ 
++/* Transport interface receive: maps classified frames to receive queues. */
++typedef struct MLX5Tir {
++    uint32_t tirn;
++    bool indirect;          /* through an RQ table rather than one RQ */
++    uint32_t inline_rqn;
++    uint32_t rqtn;
++    uint8_t hash_fn;
++    bool hash_symmetric;
++    uint8_t hash_key[40];
++    uint8_t hash_l3_type;
++    uint8_t hash_l4_type;
++    uint32_t hash_fields;
++    uint8_t self_lb;
++} MLX5Tir;
++
++/* What the device needs to know about a frame's headers. */
++typedef struct MLX5PktInfo {
++    uint16_t ethertype;     /* after any VLAN tags */
++    uint16_t l3_off;
++    uint16_t l4_off;
++    uint8_t l3_type;        /* MLX5_CQE_L3_HDR_TYPE_* */
++    uint8_t ip_proto;
++    uint8_t l4_proto;       /* IP_PROTO_TCP or IP_PROTO_UDP, else 0 */
++    bool fragment;
++} MLX5PktInfo;
++
++/* Where flow steering sends a frame. */
++typedef struct MLX5RxTarget {
++    uint32_t rqn;
++    uint32_t hash;
++    uint8_t hash_type;      /* MLX5_CQE_RSS_* */
++    uint32_t flow_tag;
++} MLX5RxTarget;
++
++#define MLX5_RX_MAX_TARGETS         8
++
+ typedef struct MLX5Stats {
+     uint64_t rx_packets;
+     uint64_t rx_bytes;
+@@ -104,6 +149,7 @@ typedef struct MLX5Stats {
+     uint64_t tx_bcast_packets;
+     uint64_t tx_mcast_packets;
+     uint64_t rx_out_of_buffer;
++    uint64_t rx_steer_missed;
+ } MLX5Stats;
+ 
+ struct MLX5State {
+@@ -136,6 +182,19 @@ struct MLX5State {
+     uint16_t vport_mtu;
+     bool port_admin_up;
+     uint8_t tx_mac[ETH_ALEN];   /* source address of the last sent frame */
++    bool pause_rx;          /* honour pause frames from the link partner */
++    bool pause_tx;          /* pause the link partner when out of buffers */
++
++    /* receive back-pressure, standing in for pause frames on the wire */
++    QEMUTimer *rx_retry_timer;
++    bool rx_stalled;
++    int64_t rx_stalled_since;
++    QEMUTimer *tx_retry_timer;
++    bool tx_paused;
++
++    /* timer value when the WQE being processed put its first frame out */
++    uint64_t tx_ts;
++    bool tx_ts_valid;
+     uint32_t next_id;       /* numbers for objects without state */
+ 
+     GHashTable *eqs;
+@@ -143,7 +202,10 @@ struct MLX5State {
+     GHashTable *sqs;
+     GHashTable *rqs;
+     GHashTable *rqts;
+-    GHashTable *tirs;       /* TIR number -> self-loopback flags */
++    GHashTable *tirs;
++    GHashTable *flow_tables;
++    uint32_t rx_root_ft;    /* where receive classification starts */
++    bool rx_root_valid;
+     GHashTable *uars;
+ 
+     MLX5Stats stats;
+@@ -152,6 +214,25 @@ struct MLX5State {
+     uint8_t *rx_buf;        /* received frame after padding or untagging */
+ };
+ 
++/* Bail out of a command handler unless both buffers cover the layouts. */
++#define MLX5_CMD_CHECK_LEN(in_typ, out_typ)                             \
++    do {                                                                \
++        if (inlen < MLX5_ST_SZ_BYTES(in_typ)) {                         \
++            return MLX5_CMD_STAT_BAD_INP_LEN_ERR;                       \
++        }                                                               \
++        if (outlen < MLX5_ST_SZ_BYTES(out_typ)) {                       \
++            return MLX5_CMD_STAT_BAD_OUTP_LEN_ERR;                      \
++        }                                                               \
++    } while (0)
++
++/*
++ * A command handler gets the gathered input and a zeroed output buffer and
++ * returns a command status (MLX5_CMD_STAT_*).
++ */
++#define MLX5_CMD_HANDLER(name)                                          \
++    int name(MLX5State *s, const uint8_t *in, uint32_t inlen,           \
++             uint8_t *out, uint32_t outlen)
++
+ /* mlx5.c */
+ uint64_t mlx5_timer_read(MLX5State *s);
+ bool mlx5_link_up(MLX5State *s);
+@@ -164,6 +245,27 @@ void mlx5_cmd_doorbell(MLX5State *s, uint32_t vector);
+ void mlx5_cmd_reset(MLX5State *s);
+ void mlx5_cmd_init(MLX5State *s);
+ void mlx5_cmd_cleanup(MLX5State *s);
++uint32_t mlx5_alloc_id(MLX5State *s);
++
++/* mlx5_fs.c */
++MLX5_CMD_HANDLER(mlx5_cmd_create_flow_table);
++MLX5_CMD_HANDLER(mlx5_cmd_modify_flow_table);
++MLX5_CMD_HANDLER(mlx5_cmd_destroy_flow_table);
++MLX5_CMD_HANDLER(mlx5_cmd_set_flow_table_root);
++MLX5_CMD_HANDLER(mlx5_cmd_create_flow_group);
++MLX5_CMD_HANDLER(mlx5_cmd_destroy_flow_group);
++MLX5_CMD_HANDLER(mlx5_cmd_set_fte);
++MLX5_CMD_HANDLER(mlx5_cmd_delete_fte);
++MLX5_CMD_HANDLER(mlx5_cmd_create_tir);
++MLX5_CMD_HANDLER(mlx5_cmd_modify_tir);
++MLX5_CMD_HANDLER(mlx5_cmd_destroy_tir);
++bool mlx5_fs_classify(MLX5State *s, const uint8_t *buf,
++                      const MLX5PktInfo *pi, MLX5RxTarget *targets,
++                      unsigned *n);
++unsigned mlx5_fs_self_lb(MLX5State *s);
++void mlx5_fs_reset(MLX5State *s);
++void mlx5_fs_init(MLX5State *s);
++void mlx5_fs_cleanup(MLX5State *s);
+ 
+ /* mlx5_dp.c */
+ void mlx5_eq_post(MLX5State *s, MLX5Eq *eq, uint8_t type, uint8_t sub_type,
+@@ -174,5 +276,7 @@ void mlx5_cq_doorbell(MLX5State *s, uint32_t cmd_ci, uint32_t cqn);
+ void mlx5_sq_doorbell(MLX5State *s, uint32_t sqn);
+ void mlx5_port_event(MLX5State *s);
+ ssize_t mlx5_receive(MLX5State *s, const uint8_t *buf, size_t size);
++void mlx5_rx_retry(MLX5State *s);
++void mlx5_tx_resume(MLX5State *s);
+ 
+ #endif
+diff --git a/hw/net/mlx5/mlx5_cmd.c b/hw/net/mlx5/mlx5_cmd.c
+index c6e35c9..22b56c1 100644
+--- a/hw/net/mlx5/mlx5_cmd.c
++++ b/hw/net/mlx5/mlx5_cmd.c
+@@ -27,17 +27,6 @@ typedef struct MLX5CmdInfo {
+     MLX5CmdFn fn;
+ } MLX5CmdInfo;
+ 
+-/* Bail out of a command handler unless both buffers cover the layouts. */
+-#define CMD_CHECK_LEN(in_typ, out_typ)                                  \
+-    do {                                                                \
+-        if (inlen < MLX5_ST_SZ_BYTES(in_typ)) {                         \
+-            return MLX5_CMD_STAT_BAD_INP_LEN_ERR;                       \
+-        }                                                               \
+-        if (outlen < MLX5_ST_SZ_BYTES(out_typ)) {                       \
+-            return MLX5_CMD_STAT_BAD_OUTP_LEN_ERR;                      \
+-        }                                                               \
+-    } while (0)
+-
+ /* Every general output layout starts with status and syndrome. */
+ #define CMD_GENERAL_OUT_LEN     16
+ 
+@@ -100,8 +89,8 @@ static int64_t mlx5_obj_alloc_num(GHashTable *table, uint32_t base,
+     return -1;
+ }
+ 
+-/* Number for an object the device keeps no state for. */
+-static uint32_t mlx5_next_id(MLX5State *s)
++/* Number for an object that is not looked up through a numbered table. */
++uint32_t mlx5_alloc_id(MLX5State *s)
+ {
+     s->next_id = (s->next_id + 1) & 0xffffff;
+     if (!s->next_id) {
+@@ -147,7 +136,7 @@ static int cmd_ok(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ static int cmd_alloc_id(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                         uint8_t *out, uint32_t outlen)
+ {
+-    stl_be_p(out + 8, mlx5_next_id(s));
++    stl_be_p(out + 8, mlx5_alloc_id(s));
+     return MLX5_CMD_STAT_OK;
+ }
+ 
+@@ -155,7 +144,7 @@ static int cmd_alloc_q_counter(MLX5State *s, const uint8_t *in,
+                                uint32_t inlen, uint8_t *out, uint32_t outlen)
+ {
+     MLX5_SET(alloc_q_counter_out, out, counter_set_id,
+-             mlx5_next_id(s) % 255 + 1);
++             mlx5_alloc_id(s) % 255 + 1);
+     return MLX5_CMD_STAT_OK;
+ }
+ 
+@@ -196,7 +185,7 @@ static int cmd_teardown_hca(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ static int cmd_query_issi(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                           uint8_t *out, uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(query_issi_in, query_issi_out);
++    MLX5_CMD_CHECK_LEN(query_issi_in, query_issi_out);
+     MLX5_SET(query_issi_out, out, current_issi, s->issi);
+     /* Interface step sequence ids 0 and 1 are supported. */
+     MLX5_SET(query_issi_out, out, supported_issi_dw0, 0x3);
+@@ -208,7 +197,7 @@ static int cmd_set_issi(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ {
+     uint16_t issi;
+ 
+-    CMD_CHECK_LEN(set_issi_in, set_issi_out);
++    MLX5_CMD_CHECK_LEN(set_issi_in, set_issi_out);
+     issi = MLX5_GET(set_issi_in, in, current_issi);
+     if (issi > 1) {
+         return MLX5_CMD_STAT_BAD_PARAM_ERR;
+@@ -221,7 +210,7 @@ static int cmd_set_issi(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ static int cmd_query_pages(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                            uint8_t *out, uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(query_pages_in, query_pages_out);
++    MLX5_CMD_CHECK_LEN(query_pages_in, query_pages_out);
+     MLX5_SET(query_pages_out, out, function_id,
+              MLX5_GET(query_pages_in, in, function_id));
+     MLX5_SET(query_pages_out, out, num_pages, 0);
+@@ -335,7 +324,7 @@ static int cmd_query_hca_cap(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     uint16_t type;
+     uint8_t *cap;
+ 
+-    CMD_CHECK_LEN(query_hca_cap_in, query_hca_cap_out);
++    MLX5_CMD_CHECK_LEN(query_hca_cap_in, query_hca_cap_out);
+     /* The low op_mod bit selects maximum or current values: same here. */
+     type = MLX5_GET(query_hca_cap_in, in, op_mod) >> 1;
+     cap = MLX5_ADDR_OF(query_hca_cap_out, out, capability);
+@@ -363,7 +352,7 @@ static int cmd_query_adapter(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     static const char psid[] = "QEMU0000000001";
+     uint8_t *blk;
+ 
+-    CMD_CHECK_LEN(query_adapter_in, query_adapter_out);
++    MLX5_CMD_CHECK_LEN(query_adapter_in, query_adapter_out);
+     blk = MLX5_ADDR_OF(query_adapter_out, out, query_adapter_struct);
+     MLX5_SET(query_adapter_param_block, blk, ieee_vendor_id, 0x0002c9);
+     MLX5_SET(query_adapter_param_block, blk, vsd_vendor_id,
+@@ -377,7 +366,7 @@ static int cmd_query_special_contexts(MLX5State *s, const uint8_t *in,
+                                       uint32_t inlen, uint8_t *out,
+                                       uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(query_special_contexts_in, query_special_contexts_out);
++    MLX5_CMD_CHECK_LEN(query_special_contexts_in, query_special_contexts_out);
+     MLX5_SET(query_special_contexts_out, out, resd_lkey, MLX5_INVALID_LKEY);
+     MLX5_SET(query_special_contexts_out, out, null_mkey, MLX5_INVALID_LKEY);
+     MLX5_SET(query_special_contexts_out, out, terminate_scatter_list_mkey,
+@@ -390,7 +379,7 @@ static int cmd_alloc_uar(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ {
+     int64_t uar;
+ 
+-    CMD_CHECK_LEN(alloc_uar_in, alloc_uar_out);
++    MLX5_CMD_CHECK_LEN(alloc_uar_in, alloc_uar_out);
+     uar = mlx5_obj_alloc_num(s->uars, MLX5_UAR_BASE_INDEX, MLX5_NUM_UARS);
+     if (uar < 0) {
+         return MLX5_CMD_STAT_NO_RES_ERR;
+@@ -403,7 +392,7 @@ static int cmd_alloc_uar(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ static int cmd_dealloc_uar(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                            uint8_t *out, uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(dealloc_uar_in, dealloc_uar_out);
++    MLX5_CMD_CHECK_LEN(dealloc_uar_in, dealloc_uar_out);
+     if (!g_hash_table_remove(s->uars, GUINT_TO_POINTER(
+                                  MLX5_GET(dealloc_uar_in, in, uar)))) {
+         return MLX5_CMD_STAT_BAD_RES_ERR;
+@@ -414,12 +403,12 @@ static int cmd_dealloc_uar(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ static int cmd_create_mkey(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                            uint8_t *out, uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(create_mkey_in, create_mkey_out);
++    MLX5_CMD_CHECK_LEN(create_mkey_in, create_mkey_out);
+     /*
+      * Only physical-address keys are meaningful to the model: every data
+      * segment address is taken as a bus address.
+      */
+-    MLX5_SET(create_mkey_out, out, mkey_index, mlx5_next_id(s));
++    MLX5_SET(create_mkey_out, out, mkey_index, mlx5_alloc_id(s));
+     return MLX5_CMD_STAT_OK;
+ }
+ 
+@@ -431,7 +420,7 @@ static int cmd_create_eq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     int64_t eqn;
+     int ret;
+ 
+-    CMD_CHECK_LEN(create_eq_in, create_eq_out);
++    MLX5_CMD_CHECK_LEN(create_eq_in, create_eq_out);
+     eqc = MLX5_ADDR_OF(create_eq_in, in, eq_context_entry);
+ 
+     eqn = mlx5_obj_alloc_num(s->eqs, 0, MLX5_MAX_EQS);
+@@ -464,7 +453,7 @@ static int cmd_create_eq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ static int cmd_destroy_eq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                           uint8_t *out, uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(destroy_eq_in, destroy_eq_out);
++    MLX5_CMD_CHECK_LEN(destroy_eq_in, destroy_eq_out);
+     if (!g_hash_table_remove(s->eqs, GUINT_TO_POINTER(
+                                  MLX5_GET(destroy_eq_in, in, eq_number)))) {
+         return MLX5_CMD_STAT_BAD_RES_ERR;
+@@ -480,7 +469,7 @@ static int cmd_create_cq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     int64_t cqn;
+     int ret;
+ 
+-    CMD_CHECK_LEN(create_cq_in, create_cq_out);
++    MLX5_CMD_CHECK_LEN(create_cq_in, create_cq_out);
+     cqc = MLX5_ADDR_OF(create_cq_in, in, cq_context);
+ 
+     cqn = mlx5_obj_alloc_num(s->cqs, 0x400, 1 << 12);
+@@ -514,7 +503,7 @@ static int cmd_create_cq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ static int cmd_destroy_cq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                           uint8_t *out, uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(destroy_cq_in, destroy_cq_out);
++    MLX5_CMD_CHECK_LEN(destroy_cq_in, destroy_cq_out);
+     if (!g_hash_table_remove(s->cqs, GUINT_TO_POINTER(
+                                  MLX5_GET(destroy_cq_in, in, cqn)))) {
+         return MLX5_CMD_STAT_BAD_RES_ERR;
+@@ -544,7 +533,7 @@ static int cmd_create_sq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     int64_t sqn;
+     int ret;
+ 
+-    CMD_CHECK_LEN(create_sq_in, create_sq_out);
++    MLX5_CMD_CHECK_LEN(create_sq_in, create_sq_out);
+     sqc = MLX5_ADDR_OF(create_sq_in, in, ctx);
+ 
+     sqn = mlx5_obj_alloc_num(s->sqs, 0x1000, 1 << 12);
+@@ -576,7 +565,7 @@ static int cmd_modify_sq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     MLX5Sq *sq;
+     uint8_t state;
+ 
+-    CMD_CHECK_LEN(modify_sq_in, modify_sq_out);
++    MLX5_CMD_CHECK_LEN(modify_sq_in, modify_sq_out);
+     sq = mlx5_obj_lookup(s->sqs, MLX5_GET(modify_sq_in, in, sqn));
+     if (!sq) {
+         return MLX5_CMD_STAT_BAD_RES_ERR;
+@@ -599,7 +588,7 @@ static int cmd_query_sq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     MLX5Sq *sq;
+     uint8_t *sqc;
+ 
+-    CMD_CHECK_LEN(query_sq_in, query_sq_out);
++    MLX5_CMD_CHECK_LEN(query_sq_in, query_sq_out);
+     sq = mlx5_obj_lookup(s->sqs, MLX5_GET(query_sq_in, in, sqn));
+     if (!sq) {
+         return MLX5_CMD_STAT_BAD_RES_ERR;
+@@ -613,7 +602,7 @@ static int cmd_query_sq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ static int cmd_destroy_sq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                           uint8_t *out, uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(destroy_sq_in, destroy_sq_out);
++    MLX5_CMD_CHECK_LEN(destroy_sq_in, destroy_sq_out);
+     if (!g_hash_table_remove(s->sqs, GUINT_TO_POINTER(
+                                  MLX5_GET(destroy_sq_in, in, sqn)))) {
+         return MLX5_CMD_STAT_BAD_RES_ERR;
+@@ -629,7 +618,7 @@ static int cmd_create_rq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     int64_t rqn;
+     int ret;
+ 
+-    CMD_CHECK_LEN(create_rq_in, create_rq_out);
++    MLX5_CMD_CHECK_LEN(create_rq_in, create_rq_out);
+     rqc = MLX5_ADDR_OF(create_rq_in, in, ctx);
+ 
+     rqn = mlx5_obj_alloc_num(s->rqs, 0x2000, 1 << 12);
+@@ -667,7 +656,7 @@ static int cmd_modify_rq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     MLX5Rq *rq;
+     uint8_t state;
+ 
+-    CMD_CHECK_LEN(modify_rq_in, modify_rq_out);
++    MLX5_CMD_CHECK_LEN(modify_rq_in, modify_rq_out);
+     rq = mlx5_obj_lookup(s->rqs, MLX5_GET(modify_rq_in, in, rqn));
+     if (!rq) {
+         return MLX5_CMD_STAT_BAD_RES_ERR;
+@@ -696,7 +685,7 @@ static int cmd_query_rq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     MLX5Rq *rq;
+     uint8_t *rqc;
+ 
+-    CMD_CHECK_LEN(query_rq_in, query_rq_out);
++    MLX5_CMD_CHECK_LEN(query_rq_in, query_rq_out);
+     rq = mlx5_obj_lookup(s->rqs, MLX5_GET(query_rq_in, in, rqn));
+     if (!rq) {
+         return MLX5_CMD_STAT_BAD_RES_ERR;
+@@ -711,7 +700,7 @@ static int cmd_query_rq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ static int cmd_destroy_rq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                           uint8_t *out, uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(destroy_rq_in, destroy_rq_out);
++    MLX5_CMD_CHECK_LEN(destroy_rq_in, destroy_rq_out);
+     if (!g_hash_table_remove(s->rqs, GUINT_TO_POINTER(
+                                  MLX5_GET(destroy_rq_in, in, rqn)))) {
+         return MLX5_CMD_STAT_BAD_RES_ERR;
+@@ -745,7 +734,7 @@ static int cmd_create_rqt(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     int64_t rqtn;
+     int ret;
+ 
+-    CMD_CHECK_LEN(create_rqt_in, create_rqt_out);
++    MLX5_CMD_CHECK_LEN(create_rqt_in, create_rqt_out);
+     rqtn = mlx5_obj_alloc_num(s->rqts, 1, 1 << 10);
+     if (rqtn < 0) {
+         return MLX5_CMD_STAT_NO_RES_ERR;
+@@ -770,7 +759,7 @@ static int cmd_modify_rqt(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     MLX5Rqt *rqt;
+     int ret;
+ 
+-    CMD_CHECK_LEN(modify_rqt_in, modify_rqt_out);
++    MLX5_CMD_CHECK_LEN(modify_rqt_in, modify_rqt_out);
+     rqt = mlx5_obj_lookup(s->rqts, MLX5_GET(modify_rqt_in, in, rqtn));
+     if (!rqt) {
+         return MLX5_CMD_STAT_BAD_RES_ERR;
+@@ -790,7 +779,7 @@ static int cmd_modify_rqt(MLX5State *s, const uint8_t *in, uint32_t inlen,
+ static int cmd_destroy_rqt(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                            uint8_t *out, uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(destroy_rqt_in, destroy_rqt_out);
++    MLX5_CMD_CHECK_LEN(destroy_rqt_in, destroy_rqt_out);
+     if (!g_hash_table_remove(s->rqts, GUINT_TO_POINTER(
+                                  MLX5_GET(destroy_rqt_in, in, rqtn)))) {
+         return MLX5_CMD_STAT_BAD_RES_ERR;
+@@ -798,53 +787,6 @@ static int cmd_destroy_rqt(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     return MLX5_CMD_STAT_OK;
+ }
+ 
+-/*
+- * Transport interface receive (TIR) objects tie flow steering to RQs.  With
+- * steering not evaluated, all the model keeps of them is whether frames the
+- * port sends to itself are looped back, which the driver's self-test uses.
+- */
+-static int cmd_create_tir(MLX5State *s, const uint8_t *in, uint32_t inlen,
+-                          uint8_t *out, uint32_t outlen)
+-{
+-    uint32_t tirn;
+-
+-    CMD_CHECK_LEN(create_tir_in, create_tir_out);
+-    tirn = mlx5_next_id(s);
+-    g_hash_table_insert(s->tirs, GUINT_TO_POINTER(tirn), GUINT_TO_POINTER(
+-                            MLX5_GET(create_tir_in, in, ctx.self_lb_block)));
+-    MLX5_SET(create_tir_out, out, tirn, tirn);
+-    return MLX5_CMD_STAT_OK;
+-}
+-
+-static int cmd_modify_tir(MLX5State *s, const uint8_t *in, uint32_t inlen,
+-                          uint8_t *out, uint32_t outlen)
+-{
+-    uint32_t tirn;
+-
+-    CMD_CHECK_LEN(modify_tir_in, modify_tir_out);
+-    tirn = MLX5_GET(modify_tir_in, in, tirn);
+-    if (!g_hash_table_contains(s->tirs, GUINT_TO_POINTER(tirn))) {
+-        return MLX5_CMD_STAT_BAD_RES_ERR;
+-    }
+-    if (MLX5_GET(modify_tir_in, in, bitmask.self_lb_en)) {
+-        g_hash_table_insert(s->tirs, GUINT_TO_POINTER(tirn), GUINT_TO_POINTER(
+-                                MLX5_GET(modify_tir_in, in,
+-                                         ctx.self_lb_block)));
+-    }
+-    return MLX5_CMD_STAT_OK;
+-}
+-
+-static int cmd_destroy_tir(MLX5State *s, const uint8_t *in, uint32_t inlen,
+-                           uint8_t *out, uint32_t outlen)
+-{
+-    CMD_CHECK_LEN(destroy_tir_in, destroy_tir_out);
+-    if (!g_hash_table_remove(s->tirs, GUINT_TO_POINTER(
+-                                 MLX5_GET(destroy_tir_in, in, tirn)))) {
+-        return MLX5_CMD_STAT_BAD_RES_ERR;
+-    }
+-    return MLX5_CMD_STAT_OK;
+-}
+-
+ static int cmd_query_nic_vport_context(MLX5State *s, const uint8_t *in,
+                                        uint32_t inlen, uint8_t *out,
+                                        uint32_t outlen)
+@@ -852,7 +794,7 @@ static int cmd_query_nic_vport_context(MLX5State *s, const uint8_t *in,
+     uint8_t *ctx, *mac = s->conf.macaddr.a;
+     uint64_t guid;
+ 
+-    CMD_CHECK_LEN(query_nic_vport_context_in, query_nic_vport_context_out);
++    MLX5_CMD_CHECK_LEN(query_nic_vport_context_in, query_nic_vport_context_out);
+     ctx = MLX5_ADDR_OF(query_nic_vport_context_out, out, nic_vport_context);
+ 
+     /* EUI-64 derived from the MAC address. */
+@@ -873,7 +815,8 @@ static int cmd_modify_nic_vport_context(MLX5State *s, const uint8_t *in,
+                                         uint32_t inlen, uint8_t *out,
+                                         uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(modify_nic_vport_context_in, modify_nic_vport_context_out);
++    MLX5_CMD_CHECK_LEN(modify_nic_vport_context_in,
++                       modify_nic_vport_context_out);
+     if (MLX5_GET(modify_nic_vport_context_in, in, field_select.mtu)) {
+         s->vport_mtu = MLX5_GET(modify_nic_vport_context_in, in,
+                                 nic_vport_context.mtu);
+@@ -885,7 +828,7 @@ static int cmd_query_vport_state(MLX5State *s, const uint8_t *in,
+                                  uint32_t inlen, uint8_t *out,
+                                  uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(query_vport_state_in, query_vport_state_out);
++    MLX5_CMD_CHECK_LEN(query_vport_state_in, query_vport_state_out);
+     MLX5_SET(query_vport_state_out, out, admin_state, MLX5_VPORT_STATE_UP);
+     MLX5_SET(query_vport_state_out, out, state,
+              mlx5_link_up(s) ? MLX5_VPORT_STATE_UP : MLX5_VPORT_STATE_DOWN);
+@@ -909,7 +852,7 @@ static int cmd_query_vport_counter(MLX5State *s, const uint8_t *in,
+ {
+     MLX5Stats *st = &s->stats;
+ 
+-    CMD_CHECK_LEN(query_vport_counter_in, query_vport_counter_out);
++    MLX5_CMD_CHECK_LEN(query_vport_counter_in, query_vport_counter_out);
+     /* The octet split by cast type is not tracked: all bytes are unicast. */
+     VPORT_COUNTER(out, received_eth_broadcast, st->rx_bcast_packets, 0);
+     VPORT_COUNTER(out, received_eth_multicast, st->rx_mcast_packets, 0);
+@@ -927,7 +870,7 @@ static int cmd_query_vport_counter(MLX5State *s, const uint8_t *in,
+ static int cmd_query_q_counter(MLX5State *s, const uint8_t *in,
+                                uint32_t inlen, uint8_t *out, uint32_t outlen)
+ {
+-    CMD_CHECK_LEN(query_q_counter_in, query_q_counter_out);
++    MLX5_CMD_CHECK_LEN(query_q_counter_in, query_q_counter_out);
+     MLX5_SET(query_q_counter_out, out, out_of_buffer,
+              s->stats.rx_out_of_buffer);
+     return MLX5_CMD_STAT_OK;
+@@ -1051,9 +994,23 @@ static int mlx5_access_reg(MLX5State *s, uint16_t reg_id, bool write,
+         return MLX5_CMD_STAT_OK;
+ 
+     case MLX5_REG_PFCC:
+-        /* Flow control: pause frames are neither sent nor honoured. */
+-        if (!write) {
+-            memset(data, 0, len);
++        /* Global pause (link-level flow control) settings. */
++        if (len < MLX5_ST_SZ_BYTES(pfcc_reg)) {
++            return MLX5_CMD_STAT_BAD_INP_LEN_ERR;
++        }
++        if (write) {
++            /* A set "mask_n" bit leaves that direction as it is. */
++            if (!MLX5_GET(pfcc_reg, data, pprx_mask_n)) {
++                s->pause_rx = MLX5_GET(pfcc_reg, data, pprx);
++            }
++            if (!MLX5_GET(pfcc_reg, data, pptx_mask_n)) {
++                s->pause_tx = MLX5_GET(pfcc_reg, data, pptx);
++            }
++        } else {
++            MLX5_SET(pfcc_reg, data, pprx, s->pause_rx);
++            MLX5_SET(pfcc_reg, data, aprx, s->pause_rx);
++            MLX5_SET(pfcc_reg, data, pptx, s->pause_tx);
++            MLX5_SET(pfcc_reg, data, aptx, s->pause_tx);
+         }
+         return MLX5_CMD_STAT_OK;
+ 
+@@ -1082,7 +1039,7 @@ static int cmd_access_reg(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     bool write;
+     int ret;
+ 
+-    CMD_CHECK_LEN(access_register_in, access_register_out);
++    MLX5_CMD_CHECK_LEN(access_register_in, access_register_out);
+     reg_id = MLX5_GET(access_register_in, in, register_id);
+     write = MLX5_GET(access_register_in, in, op_mod) ==
+             MLX5_ACCESS_REGISTER_IN_OP_MOD_WRITE;
+@@ -1150,9 +1107,9 @@ static const MLX5CmdInfo mlx5_cmds[] = {
+     CMD(CREATE_RQT, cmd_create_rqt),
+     CMD(MODIFY_RQT, cmd_modify_rqt),
+     CMD(DESTROY_RQT, cmd_destroy_rqt),
+-    CMD(CREATE_TIR, cmd_create_tir),
+-    CMD(MODIFY_TIR, cmd_modify_tir),
+-    CMD(DESTROY_TIR, cmd_destroy_tir),
++    CMD(CREATE_TIR, mlx5_cmd_create_tir),
++    CMD(MODIFY_TIR, mlx5_cmd_modify_tir),
++    CMD(DESTROY_TIR, mlx5_cmd_destroy_tir),
+     CMD(CREATE_TIS, cmd_alloc_id),
+     CMD(MODIFY_TIS, cmd_ok),
+     CMD(DESTROY_TIS, cmd_ok),
+@@ -1167,18 +1124,15 @@ static const MLX5CmdInfo mlx5_cmds[] = {
+     CMD(DEALLOC_Q_COUNTER, cmd_ok),
+     CMD(QUERY_Q_COUNTER, cmd_query_q_counter),
+ 
+-    /*
+-     * Flow steering: tables, groups and rules are accepted so that the
+-     * driver's receive pipeline sets up, but they are not evaluated.
+-     */
+-    CMD(CREATE_FLOW_TABLE, cmd_alloc_id),
+-    CMD(DESTROY_FLOW_TABLE, cmd_ok),
+-    CMD(MODIFY_FLOW_TABLE, cmd_ok),
+-    CMD(SET_FLOW_TABLE_ROOT, cmd_ok),
+-    CMD(CREATE_FLOW_GROUP, cmd_alloc_id),
+-    CMD(DESTROY_FLOW_GROUP, cmd_ok),
+-    CMD(SET_FLOW_TABLE_ENTRY, cmd_ok),
+-    CMD(DELETE_FLOW_TABLE_ENTRY, cmd_ok),
++    /* Receive flow steering (mlx5_fs.c) */
++    CMD(CREATE_FLOW_TABLE, mlx5_cmd_create_flow_table),
++    CMD(DESTROY_FLOW_TABLE, mlx5_cmd_destroy_flow_table),
++    CMD(MODIFY_FLOW_TABLE, mlx5_cmd_modify_flow_table),
++    CMD(SET_FLOW_TABLE_ROOT, mlx5_cmd_set_flow_table_root),
++    CMD(CREATE_FLOW_GROUP, mlx5_cmd_create_flow_group),
++    CMD(DESTROY_FLOW_GROUP, mlx5_cmd_destroy_flow_group),
++    CMD(SET_FLOW_TABLE_ENTRY, mlx5_cmd_set_fte),
++    CMD(DELETE_FLOW_TABLE_ENTRY, mlx5_cmd_delete_fte),
+     CMD(ALLOC_FLOW_COUNTER, cmd_alloc_id),
+     CMD(DEALLOC_FLOW_COUNTER, cmd_ok),
+     CMD(QUERY_FLOW_COUNTER, cmd_ok),
+@@ -1364,7 +1318,7 @@ void mlx5_cmd_doorbell(MLX5State *s, uint32_t vector)
+ /* Drop every object and return to the state before ENABLE_HCA. */
+ void mlx5_cmd_reset(MLX5State *s)
+ {
+-    g_hash_table_remove_all(s->tirs);
++    mlx5_fs_reset(s);
+     g_hash_table_remove_all(s->rqts);
+     g_hash_table_remove_all(s->rqs);
+     g_hash_table_remove_all(s->sqs);
+@@ -1377,6 +1331,9 @@ void mlx5_cmd_reset(MLX5State *s)
+     s->issi = 0;
+     s->next_id = 0;
+     s->port_admin_up = false;
++    /* Flow control is on in both directions by default, as on hardware. */
++    s->pause_rx = true;
++    s->pause_tx = true;
+     s->admin_mtu = 1500 + ETH_HLEN + 8;
+     s->vport_mtu = s->admin_mtu;
+     memset(&s->stats, 0, sizeof(s->stats));
+@@ -1390,14 +1347,14 @@ void mlx5_cmd_init(MLX5State *s)
+     s->sqs = g_hash_table_new_full(NULL, NULL, NULL, mlx5_sq_destroy);
+     s->rqs = g_hash_table_new_full(NULL, NULL, NULL, mlx5_rq_destroy);
+     s->rqts = g_hash_table_new_full(NULL, NULL, NULL, mlx5_rqt_destroy);
+-    s->tirs = g_hash_table_new(NULL, NULL);
+     s->uars = g_hash_table_new(NULL, NULL);
++    mlx5_fs_init(s);
+     mlx5_cmd_reset(s);
+ }
+ 
+ void mlx5_cmd_cleanup(MLX5State *s)
+ {
+-    g_hash_table_destroy(s->tirs);
++    mlx5_fs_cleanup(s);
+     g_hash_table_destroy(s->rqts);
+     g_hash_table_destroy(s->rqs);
+     g_hash_table_destroy(s->sqs);
+diff --git a/hw/net/mlx5/mlx5_dp.c b/hw/net/mlx5/mlx5_dp.c
+index 2a88f49..2454bc5 100644
+--- a/hw/net/mlx5/mlx5_dp.c
++++ b/hw/net/mlx5/mlx5_dp.c
+@@ -20,6 +20,7 @@
+ #include "qemu/units.h"
+ #include "qemu/log.h"
+ #include "qemu/crc32c.h"
++#include "qemu/timer.h"
+ #include "hw/pci/msix.h"
+ #include "net/eth.h"
+ #include "net/checksum.h"
+@@ -31,15 +32,6 @@
+ #define TCP_FLAG_ACK    0x10
+ #define TCP_FLAG_CWR    0x80
+ 
+-/* What the device needs to know about a frame's headers. */
+-typedef struct MLX5PktInfo {
+-    uint16_t l3_off;
+-    uint16_t l4_off;
+-    uint8_t l3_type;        /* MLX5_CQE_L3_HDR_TYPE_* */
+-    uint8_t l4_proto;       /* IP_PROTO_TCP or IP_PROTO_UDP, else 0 */
+-    bool fragment;
+-} MLX5PktInfo;
+-
+ static void mlx5_parse_pkt(const uint8_t *buf, size_t len, MLX5PktInfo *pi)
+ {
+     size_t off = ETH_HLEN;
+@@ -55,6 +47,7 @@ static void mlx5_parse_pkt(const uint8_t *buf, size_t len, MLX5PktInfo *pi)
+         proto = lduw_be_p(buf + off + 2);
+         off += 4;
+     }
++    pi->ethertype = proto;
+     pi->l3_off = off;
+ 
+     if (proto == ETH_P_IP && off + sizeof(struct ip_header) <= len &&
+@@ -77,6 +70,7 @@ static void mlx5_parse_pkt(const uint8_t *buf, size_t len, MLX5PktInfo *pi)
+     } else {
+         return;
+     }
++    pi->ip_proto = l4_proto;
+ 
+     if (pi->fragment) {
+         return;
+@@ -141,6 +135,59 @@ static void mlx5_tx_csum(uint8_t *buf, size_t len, bool l3, bool l4)
+     stw_be_p(l4h + csum_off, csum);
+ }
+ 
++/*
++ * Verify a received frame's IPv4 header checksum and TCP/UDP checksum, for
++ * the "checksum OK" flags in the completion.
++ */
++static void mlx5_rx_csum_verify(const uint8_t *buf, size_t len,
++                                const MLX5PktInfo *pi, bool *l3_ok,
++                                bool *l4_ok)
++{
++    const uint8_t *ip = buf + pi->l3_off;
++    const uint8_t *l4h = buf + pi->l4_off;
++    size_t hdr_len = pi->l4_off - pi->l3_off;
++    size_t l4_len;
++    uint32_t sum;
++
++    *l3_ok = *l4_ok = false;
++    if (pi->l3_type == MLX5_CQE_L3_HDR_TYPE_IPV4) {
++        size_t ihl = (ip[0] & 0xf) * 4;
++        size_t total = lduw_be_p(ip + 2);
++
++        *l3_ok = mlx5_csum_fold(net_checksum_add(ihl, (uint8_t *)ip)) ==
++                 0xffff;
++        if (!pi->l4_proto || total < hdr_len) {
++            return;
++        }
++        l4_len = total - hdr_len;
++        sum = net_checksum_add(8, (uint8_t *)ip + 12);
++    } else if (pi->l3_type == MLX5_CQE_L3_HDR_TYPE_IPV6) {
++        *l3_ok = true;
++        if (!pi->l4_proto) {
++            return;
++        }
++        l4_len = lduw_be_p(ip + 4);
++        sum = net_checksum_add(32, (uint8_t *)ip + 8);
++    } else {
++        return;
++    }
++
++    if (l4_len < (pi->l4_proto == IP_PROTO_TCP ? sizeof(struct tcp_header) :
++                                                 sizeof(struct udp_header)) ||
++        pi->l4_off + l4_len > len) {
++        return;
++    }
++    if (pi->l4_proto == IP_PROTO_UDP && !lduw_be_p(l4h + 6) &&
++        pi->l3_type == MLX5_CQE_L3_HDR_TYPE_IPV4) {
++        /* UDP over IPv4 sent without a checksum. */
++        *l4_ok = true;
++        return;
++    }
++    sum += pi->l4_proto + l4_len;
++    sum += net_checksum_add(l4_len, (uint8_t *)l4h);
++    *l4_ok = mlx5_csum_fold(sum) == 0xffff;
++}
++
+ static uint32_t mlx5_dbr_read(MLX5State *s, uint64_t dbr_addr, unsigned idx)
+ {
+     uint32_t val = 0;
+@@ -308,25 +355,20 @@ static void mlx5_cqe_set_ts(struct mlx5_cqe64 *cqe, uint64_t ts)
+  * Transmit
+  */
+ 
+-/* Self-loopback flags (MLX5_TIRC_SELF_LB_BLOCK_*) enabled on any TIR. */
+-static unsigned mlx5_self_lb(MLX5State *s)
+-{
+-    GHashTableIter iter;
+-    gpointer value;
+-    unsigned flags = 0;
+-
+-    g_hash_table_iter_init(&iter, s->tirs);
+-    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+-        flags |= GPOINTER_TO_UINT(value);
+-    }
+-    return flags;
+-}
+-
+ static void mlx5_send(MLX5State *s, const uint8_t *buf, size_t len)
+ {
+     const uint8_t *src = buf + ETH_ALEN;
+     MLX5Stats *st = &s->stats;
+-    unsigned lb = mlx5_self_lb(s);
++    unsigned lb = mlx5_fs_self_lb(s);
++
++    /*
++     * Timestamp the frame as it leaves, like the MAC does.  Any reply is
++     * stamped on arrival and so can never appear to precede it.
++     */
++    if (!s->tx_ts_valid) {
++        s->tx_ts = mlx5_timer_read(s);
++        s->tx_ts_valid = true;
++    }
+ 
+     st->tx_packets++;
+     st->tx_bytes += len;
+@@ -337,9 +379,9 @@ static void mlx5_send(MLX5State *s, const uint8_t *buf, size_t len)
+     }
+ 
+     /*
+-     * Despite the field's name, a set bit turns self-loopback on.  Without
+-     * steering the port's own address is taken to be the configured one or
+-     * whatever it last used as a source.
++     * Despite the field's name, a set bit turns self-loopback on.  The
++     * port's own address is taken to be the configured one or whatever it
++     * last used as a source.
+      */
+     if (is_multicast_ether_addr(buf)) {
+         if (lb & MLX5_TIRC_SELF_LB_BLOCK_BLOCK_MULTICAST) {
+@@ -348,9 +390,11 @@ static void mlx5_send(MLX5State *s, const uint8_t *buf, size_t len)
+     } else if ((lb & MLX5_TIRC_SELF_LB_BLOCK_BLOCK_UNICAST) &&
+                (!memcmp(buf, s->conf.macaddr.a, ETH_ALEN) ||
+                 !memcmp(buf, s->tx_mac, ETH_ALEN))) {
++        trace_mlx5_send(len, true);
+         mlx5_receive(s, buf, len);
+         return;
+     }
++    trace_mlx5_send(len, false);
+     if (!is_multicast_ether_addr(src) && (src[0] | src[1] | src[2] | src[3] |
+                                           src[4] | src[5])) {
+         memcpy(s->tx_mac, src, ETH_ALEN);
+@@ -494,8 +538,6 @@ static bool mlx5_sq_process_wqe(MLX5State *s, MLX5Sq *sq)
+     uint8_t wqe[MLX5_SEND_WQE_BB * 16];
+     uint32_t nent = 1u << sq->wq.log_size;
+     const struct mlx5_wqe_ctrl_seg *ctrl = (const void *)wqe;
+-    /* Stamp the frame as it starts to leave, before any reply can arrive. */
+-    uint64_t ts = mlx5_timer_read(s);
+     uint8_t opcode, ds;
+     unsigned nbb, i;
+     MLX5Cq *cq;
+@@ -522,6 +564,7 @@ static bool mlx5_sq_process_wqe(MLX5State *s, MLX5Sq *sq)
+     }
+     trace_mlx5_tx(sq->sqn, sq->cc, opcode, ds);
+ 
++    s->tx_ts_valid = false;
+     switch (opcode) {
+     case MLX5_OPCODE_NOP:
+         break;
+@@ -545,7 +588,7 @@ static bool mlx5_sq_process_wqe(MLX5State *s, MLX5Sq *sq)
+             .wqe_counter = cpu_to_be16(sq->cc),
+         };
+ 
+-        mlx5_cqe_set_ts(&cqe, ts);
++        mlx5_cqe_set_ts(&cqe, s->tx_ts_valid ? s->tx_ts : mlx5_timer_read(s));
+         mlx5_cq_post(s, cq, &cqe);
+     }
+     sq->cc += nbb;
+@@ -573,31 +616,36 @@ void mlx5_sq_doorbell(MLX5State *s, uint32_t sqn)
+     }
+     pc = mlx5_dbr_read(s, sq->wq.dbr_addr, MLX5_SND_DBR);
+     for (budget = 1u << sq->wq.log_size; budget && sq->cc != pc; budget--) {
++        if (s->pause_rx && !qemu_can_send_packet(qemu_get_queue(s->nic))) {
++            /* The link partner has paused us: pick up from here later. */
++            s->tx_paused = true;
++            timer_mod(s->tx_retry_timer,
++                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                      MLX5_RX_RETRY_NS);
++            break;
++        }
+         if (!mlx5_sq_process_wqe(s, sq)) {
+             break;
+         }
+     }
+ }
+ 
+-/*
+- * Receive
+- */
+-
+-static uint32_t mlx5_flow_hash(const uint8_t *buf, const MLX5PktInfo *pi)
++/* Carry on with send queues that stopped because the port was paused. */
++void mlx5_tx_resume(MLX5State *s)
+ {
+-    uint32_t hash = 0;
++    g_autoptr(GList) sqns = g_hash_table_get_keys(s->sqs);
++    GList *l;
+ 
+-    if (pi->l3_type == MLX5_CQE_L3_HDR_TYPE_IPV4) {
+-        hash = crc32c(hash, buf + pi->l3_off + 12, 8);
+-    } else if (pi->l3_type == MLX5_CQE_L3_HDR_TYPE_IPV6) {
+-        hash = crc32c(hash, buf + pi->l3_off + 8, 32);
++    s->tx_paused = false;
++    for (l = sqns; l && !s->tx_paused; l = l->next) {
++        mlx5_sq_doorbell(s, GPOINTER_TO_UINT(l->data));
+     }
+-    if (pi->l4_proto) {
+-        hash = crc32c(hash, buf + pi->l4_off, 4);
+-    }
+-    return hash;
+ }
+ 
++/*
++ * Receive
++ */
++
+ static bool mlx5_rq_has_buffers(MLX5State *s, MLX5Rq *rq)
+ {
+     uint16_t pc = mlx5_dbr_read(s, rq->wq.dbr_addr, MLX5_RCV_DBR);
+@@ -606,16 +654,26 @@ static bool mlx5_rq_has_buffers(MLX5State *s, MLX5Rq *rq)
+ }
+ 
+ /*
+- * Flow steering rules are not evaluated.  Instead a frame goes to the RQ that
+- * the driver's RSS indirection table (the largest RQ table) maps its flow
+- * hash to, which spreads flows over the channels like the real device does.
++ * Without any receive steering set up by the driver, frames go to the RQ
++ * that the largest RQ table maps their flow hash to, or else to any RQ with
++ * buffers.
+  */
+-static MLX5Rq *mlx5_pick_rq(MLX5State *s, uint32_t hash)
++static void mlx5_default_target(MLX5State *s, const uint8_t *buf,
++                                const MLX5PktInfo *pi, MLX5RxTarget *target,
++                                unsigned *n)
+ {
+     GHashTableIter iter;
+     gpointer value;
+     MLX5Rqt *rqt = NULL;
+-    MLX5Rq *rq;
++    uint32_t hash = 0;
++
++    if (pi->l3_type == MLX5_CQE_L3_HDR_TYPE_IPV4) {
++        hash = crc32c(hash, buf + pi->l3_off + 12, 8);
++    } else if (pi->l3_type == MLX5_CQE_L3_HDR_TYPE_IPV6) {
++        hash = crc32c(hash, buf + pi->l3_off + 8, 32);
++    }
++    memset(target, 0, sizeof(*target));
++    *n = 1;
+ 
+     g_hash_table_iter_init(&iter, s->rqts);
+     while (g_hash_table_iter_next(&iter, NULL, &value)) {
+@@ -627,19 +685,19 @@ static MLX5Rq *mlx5_pick_rq(MLX5State *s, uint32_t hash)
+         }
+     }
+     if (rqt && rqt->size) {
+-        return g_hash_table_lookup(s->rqs, GUINT_TO_POINTER(
+-                                       rqt->rqns[hash % rqt->size]));
++        target->rqn = rqt->rqns[hash % rqt->size];
++        return;
+     }
+-
+-    /* No indirection table: any RQ with buffers will do. */
+     g_hash_table_iter_init(&iter, s->rqs);
+     while (g_hash_table_iter_next(&iter, NULL, &value)) {
+-        rq = value;
++        MLX5Rq *rq = value;
++
+         if (mlx5_rq_has_buffers(s, rq)) {
+-            return rq;
++            target->rqn = rq->rqn;
++            return;
+         }
+     }
+-    return NULL;
++    *n = 0;
+ }
+ 
+ /* Copy a frame into the RQ's next receive WQE.  Returns false if it is lost. */
+@@ -696,44 +754,61 @@ static bool mlx5_rq_fill(MLX5State *s, MLX5Rq *rq, const uint8_t *buf,
+     return true;
+ }
+ 
+-ssize_t mlx5_receive(MLX5State *s, const uint8_t *buf, size_t size)
++/*
++ * A frame is about to be dropped because its receive queue has no buffers.
++ * With flow control on, a real port would have paused its link partner by
++ * now.  Model that by leaving the frame with the network backend and trying
++ * again shortly, unless the queue has been empty for too long or was never
++ * filled at all (the driver's "drop" queue).
++ */
++static bool mlx5_rx_hold(MLX5State *s, const MLX5RxTarget *target)
++{
++    MLX5Rq *rq = g_hash_table_lookup(s->rqs, GUINT_TO_POINTER(target->rqn));
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    if (!s->pause_tx || !rq || rq->state != MLX5_RQC_STATE_RDY || !rq->cc ||
++        mlx5_rq_has_buffers(s, rq)) {
++        return false;
++    }
++    if (!s->rx_stalled) {
++        s->rx_stalled = true;
++        s->rx_stalled_since = now;
++    }
++    if (now - s->rx_stalled_since > MLX5_RX_STALL_NS) {
++        return false;
++    }
++    timer_mod(s->rx_retry_timer, now + MLX5_RX_RETRY_NS);
++    return true;
++}
++
++/* Offer held-back frames to the receive path again. */
++void mlx5_rx_retry(MLX5State *s)
++{
++    qemu_flush_queued_packets(qemu_get_queue(s->nic));
++}
++
++/* Deliver a frame to one receive queue and complete it. */
++static void mlx5_rx_deliver(MLX5State *s, const MLX5RxTarget *target,
++                            const uint8_t *buf, size_t size, uint64_t ts)
+ {
++    MLX5Rq *rq = g_hash_table_lookup(s->rqs, GUINT_TO_POINTER(target->rqn));
+     MLX5Stats *st = &s->stats;
+     struct mlx5_cqe64 cqe = { };
+-    size_t orig_size = size;
+     uint16_t wqe_counter;
++    bool l3_ok, l4_ok;
+     MLX5PktInfo pi;
+-    uint32_t hash;
+-    MLX5Rq *rq;
+     MLX5Cq *cq;
+ 
+-    if (!s->hca_initialized || !mlx5_link_up(s) || size < ETH_HLEN ||
+-        size > MLX5_MAX_FRAME) {
+-        return orig_size;
+-    }
+-
+-    /* Backends may hand over runt frames; the wire never does. */
+-    if (size < ETH_ZLEN) {
+-        memcpy(s->rx_buf, buf, size);
+-        memset(s->rx_buf + size, 0, ETH_ZLEN - size);
+-        buf = s->rx_buf;
+-        size = ETH_ZLEN;
+-    }
+-
+-    mlx5_parse_pkt(buf, size, &pi);
+-    hash = mlx5_flow_hash(buf, &pi);
+-    rq = mlx5_pick_rq(s, hash);
+     if (!rq || !mlx5_rq_has_buffers(s, rq)) {
+         st->rx_out_of_buffer++;
+         trace_mlx5_rx_drop("no receive buffer", size);
+-        return orig_size;
++        return;
+     }
+     cq = g_hash_table_lookup(s->cqs, GUINT_TO_POINTER(rq->cqn));
+     if (!cq) {
+-        return orig_size;
++        return;
+     }
+ 
+-    cqe.l4_l3_hdr_type = pi.l3_type << 2;
+     if (rq->vlan_strip && lduw_be_p(buf + 12) == ETH_P_VLAN &&
+         size >= ETH_HLEN + 4) {
+         /* Hand the tag over in the CQE instead of in the frame. */
+@@ -743,24 +818,32 @@ ssize_t mlx5_receive(MLX5State *s, const uint8_t *buf, size_t size)
+         memmove(s->rx_buf + 12, buf + 16, size - 16);
+         buf = s->rx_buf;
+         size -= 4;
+-        mlx5_parse_pkt(buf, size, &pi);
+     }
++    mlx5_parse_pkt(buf, size, &pi);
+ 
+     if (!mlx5_rq_fill(s, rq, buf, size, &wqe_counter)) {
+         st->rx_out_of_buffer++;
+-        return orig_size;
++        return;
+     }
+ 
+     cqe.op_own = MLX5_CQE_RESP_SEND << 4;
+     cqe.byte_cnt = cpu_to_be32(size);
+     cqe.wqe_counter = cpu_to_be16(wqe_counter);
+     cqe.flags_rqpn = cpu_to_be32(rq->rqn);
++    /* The low 24 bits carry the matching rule's flow tag. */
++    cqe.sop_drop_qpn = cpu_to_be32(target->flow_tag & 0xffffff);
++    cqe.rss_hash_result = cpu_to_be32(target->hash);
++    cqe.rss_hash_type = target->hash_type;
++    cqe.l4_l3_hdr_type |= pi.l3_type << 2;
+     cqe.hds_ip_ext = MLX5_CQE_L2_OK;
+-    cqe.rss_hash_result = cpu_to_be32(hash);
+-    if (pi.l3_type) {
++    mlx5_rx_csum_verify(buf, size, &pi, &l3_ok, &l4_ok);
++    if (l3_ok) {
+         cqe.hds_ip_ext |= MLX5_CQE_L3_OK;
+-        cqe.rss_hash_type = pi.l3_type == MLX5_CQE_L3_HDR_TYPE_IPV4 ?
+-                            MLX5_CQE_RSS_IPV4 : MLX5_CQE_RSS_IPV6;
++    }
++    if (l4_ok) {
++        cqe.hds_ip_ext |= MLX5_CQE_L4_OK;
++    }
++    if (pi.l3_type) {
+         /*
+          * Ones' complement sum from the network header to the end of the
+          * frame; the driver hands it to the stack as CHECKSUM_COMPLETE.
+@@ -772,21 +855,18 @@ ssize_t mlx5_receive(MLX5State *s, const uint8_t *buf, size_t size)
+         uint8_t flags = buf[pi.l4_off + 13];
+         size_t data_off = pi.l4_off + (buf[pi.l4_off + 12] >> 4) * 4;
+ 
+-        cqe.hds_ip_ext |= MLX5_CQE_L4_OK;
+-        cqe.rss_hash_type |= MLX5_CQE_RSS_L4_TCP;
+         cqe.l4_l3_hdr_type |=
+             (!(flags & TCP_FLAG_ACK) ? MLX5_CQE_L4_HDR_TYPE_TCP_NO_ACK :
+              data_off < size ? MLX5_CQE_L4_HDR_TYPE_TCP_ACK_AND_DATA :
+                                MLX5_CQE_L4_HDR_TYPE_TCP_ACK_NO_DATA) << 4;
+     } else if (pi.l4_proto == IP_PROTO_UDP) {
+-        cqe.hds_ip_ext |= MLX5_CQE_L4_OK;
+-        cqe.rss_hash_type |= MLX5_CQE_RSS_L4_UDP;
+         cqe.l4_l3_hdr_type |= MLX5_CQE_L4_HDR_TYPE_UDP << 4;
+     }
+-    mlx5_cqe_set_ts(&cqe, mlx5_timer_read(s));
++    mlx5_cqe_set_ts(&cqe, ts);
+ 
+     trace_mlx5_rx(rq->rqn, wqe_counter, size);
+     mlx5_cq_post(s, cq, &cqe);
++    s->rx_stalled = false;
+ 
+     st->rx_packets++;
+     st->rx_bytes += size;
+@@ -795,5 +875,44 @@ ssize_t mlx5_receive(MLX5State *s, const uint8_t *buf, size_t size)
+     } else if (is_multicast_ether_addr(buf)) {
+         st->rx_mcast_packets++;
+     }
++}
++
++ssize_t mlx5_receive(MLX5State *s, const uint8_t *buf, size_t size)
++{
++    /* Timestamp on arrival, before any of the work of receiving. */
++    uint64_t ts = mlx5_timer_read(s);
++    MLX5RxTarget targets[MLX5_RX_MAX_TARGETS];
++    uint8_t padded[ETH_ZLEN];
++    size_t orig_size = size;
++    MLX5PktInfo pi;
++    unsigned n, i;
++
++    if (!s->hca_initialized || !mlx5_link_up(s) || size < ETH_HLEN ||
++        size > MLX5_MAX_FRAME) {
++        return orig_size;
++    }
++
++    /* Backends may hand over runt frames; the wire never does. */
++    if (size < ETH_ZLEN) {
++        memcpy(padded, buf, size);
++        memset(padded + size, 0, ETH_ZLEN - size);
++        buf = padded;
++        size = ETH_ZLEN;
++    }
++
++    mlx5_parse_pkt(buf, size, &pi);
++    if (!mlx5_fs_classify(s, buf, &pi, targets, &n)) {
++        mlx5_default_target(s, buf, &pi, targets, &n);
++    }
++    if (!n) {
++        s->stats.rx_steer_missed++;
++        trace_mlx5_rx_drop("no matching flow rule", size);
++    } else if (mlx5_rx_hold(s, &targets[0])) {
++        /* Not consumed: the backend queues the frame until we flush. */
++        return 0;
++    }
++    for (i = 0; i < n; i++) {
++        mlx5_rx_deliver(s, &targets[i], buf, size, ts);
++    }
+     return orig_size;
+ }
+diff --git a/hw/net/mlx5/mlx5_fs.c b/hw/net/mlx5/mlx5_fs.c
+new file mode 100644
+index 0000000..087c4dc
+--- /dev/null
++++ b/hw/net/mlx5/mlx5_fs.c
+@@ -0,0 +1,673 @@
++/*
++ * Mellanox ConnectX (mlx5) emulation: receive flow steering
++ *
++ * The driver programs how received frames are classified:
++ *
++ *  - A flow table holds flow table entries (FTEs) ordered by index.  Each
++ *    FTE belongs to a flow group, which says which header fields the entries
++ *    in its index range match on; the FTE supplies the values.
++ *  - The lowest-index matching FTE decides: drop the frame, or forward it
++ *    to further flow tables and/or to TIRs.  A frame no FTE matches goes to
++ *    the table's miss table if it has one and is dropped otherwise.
++ *  - A TIR (transport interface receive) picks the receive queue: a fixed
++ *    one, or one from an RQ table indexed by the RSS hash of the fields the
++ *    TIR selects.
++ *
++ * Classification starts at the table the driver made the root.  Only the
++ * outer Ethernet/VLAN/IP/TCP/UDP fields are matched; rules on tunnel or
++ * metadata fields only match if they ask for zero.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "mlx5.h"
++#include "../trace.h"
++
++#define MLX5_FT_NIC_RX          0x0
++
++/* fte_match_param is a sequence of equally sized sections. */
++#define MLX5_MATCH_SECTION_SIZE MLX5_ST_SZ_BYTES(fte_match_set_lyr_2_4)
++#define MLX5_MATCH_SECTIONS     7
++#define MLX5_MATCH_SIZE         (MLX5_MATCH_SECTION_SIZE * MLX5_MATCH_SECTIONS)
++
++#define MLX5_FS_MAX_DEPTH       64
++
++typedef struct MLX5FlowDest {
++    uint8_t type;
++    uint32_t id;
++} MLX5FlowDest;
++
++typedef struct MLX5Fte {
++    uint32_t group_id;
++    uint32_t action;
++    uint32_t flow_tag;
++    uint32_t ndests;
++    MLX5FlowDest *dests;
++    uint8_t value[MLX5_MATCH_SIZE];
++} MLX5Fte;
++
++typedef struct MLX5FlowGroup {
++    uint8_t criteria_enable;    /* bit n: section n of the mask is in use */
++    uint8_t mask[MLX5_MATCH_SIZE];
++} MLX5FlowGroup;
++
++typedef struct MLX5FlowTable {
++    uint8_t type;
++    bool miss_fwd;
++    uint32_t miss_table_id;
++    GHashTable *groups;         /* group id -> MLX5FlowGroup */
++    GTree *ftes;                /* flow index -> MLX5Fte, in index order */
++} MLX5FlowTable;
++
++static void mlx5_fte_free(gpointer data)
++{
++    MLX5Fte *fte = data;
++
++    g_free(fte->dests);
++    g_free(fte);
++}
++
++static void mlx5_flow_table_free(gpointer data)
++{
++    MLX5FlowTable *ft = data;
++
++    g_hash_table_destroy(ft->groups);
++    g_tree_destroy(ft->ftes);
++    g_free(ft);
++}
++
++static gint mlx5_index_cmp(gconstpointer a, gconstpointer b, gpointer data)
++{
++    uint32_t x = GPOINTER_TO_UINT(a), y = GPOINTER_TO_UINT(b);
++
++    return x < y ? -1 : x > y;
++}
++
++static MLX5FlowTable *mlx5_flow_table_get(MLX5State *s, uint32_t id)
++{
++    return g_hash_table_lookup(s->flow_tables, GUINT_TO_POINTER(id));
++}
++
++/*
++ * Commands
++ */
++
++static void mlx5_flow_table_set_miss(MLX5FlowTable *ft, const uint8_t *ctx)
++{
++    ft->miss_fwd = MLX5_GET(flow_table_context, ctx, table_miss_action) ==
++                   MLX5_FLOW_TABLE_MISS_ACTION_FWD;
++    ft->miss_table_id = MLX5_GET(flow_table_context, ctx, table_miss_id);
++}
++
++int mlx5_cmd_create_flow_table(MLX5State *s, const uint8_t *in,
++                               uint32_t inlen, uint8_t *out, uint32_t outlen)
++{
++    MLX5FlowTable *ft;
++    uint32_t id;
++
++    MLX5_CMD_CHECK_LEN(create_flow_table_in, create_flow_table_out);
++    ft = g_new0(MLX5FlowTable, 1);
++    ft->type = MLX5_GET(create_flow_table_in, in, table_type);
++    ft->groups = g_hash_table_new_full(NULL, NULL, NULL, g_free);
++    ft->ftes = g_tree_new_full(mlx5_index_cmp, NULL, NULL, mlx5_fte_free);
++    mlx5_flow_table_set_miss(ft, MLX5_ADDR_OF(create_flow_table_in, in,
++                                              flow_table_context));
++    id = mlx5_alloc_id(s);
++    g_hash_table_insert(s->flow_tables, GUINT_TO_POINTER(id), ft);
++    trace_mlx5_flow_table(id, ft->type, ft->miss_fwd, ft->miss_table_id);
++    MLX5_SET(create_flow_table_out, out, table_id, id);
++    return MLX5_CMD_STAT_OK;
++}
++
++int mlx5_cmd_modify_flow_table(MLX5State *s, const uint8_t *in,
++                               uint32_t inlen, uint8_t *out, uint32_t outlen)
++{
++    MLX5FlowTable *ft;
++    uint32_t id;
++
++    MLX5_CMD_CHECK_LEN(modify_flow_table_in, modify_flow_table_out);
++    id = MLX5_GET(modify_flow_table_in, in, table_id);
++    ft = mlx5_flow_table_get(s, id);
++    if (!ft) {
++        return MLX5_CMD_STAT_BAD_RES_ERR;
++    }
++    if (MLX5_GET(modify_flow_table_in, in, modify_field_select) &
++        MLX5_MODIFY_FLOW_TABLE_MISS_TABLE_ID) {
++        mlx5_flow_table_set_miss(ft, MLX5_ADDR_OF(modify_flow_table_in, in,
++                                                  flow_table_context));
++        trace_mlx5_flow_table(id, ft->type, ft->miss_fwd, ft->miss_table_id);
++    }
++    return MLX5_CMD_STAT_OK;
++}
++
++int mlx5_cmd_destroy_flow_table(MLX5State *s, const uint8_t *in,
++                                uint32_t inlen, uint8_t *out, uint32_t outlen)
++{
++    uint32_t id;
++
++    MLX5_CMD_CHECK_LEN(destroy_flow_table_in, destroy_flow_table_out);
++    id = MLX5_GET(destroy_flow_table_in, in, table_id);
++    if (!g_hash_table_remove(s->flow_tables, GUINT_TO_POINTER(id))) {
++        return MLX5_CMD_STAT_BAD_RES_ERR;
++    }
++    if (s->rx_root_valid && s->rx_root_ft == id) {
++        s->rx_root_valid = false;
++    }
++    return MLX5_CMD_STAT_OK;
++}
++
++int mlx5_cmd_set_flow_table_root(MLX5State *s, const uint8_t *in,
++                                 uint32_t inlen, uint8_t *out,
++                                 uint32_t outlen)
++{
++    uint32_t id;
++
++    MLX5_CMD_CHECK_LEN(set_flow_table_root_in, set_flow_table_root_out);
++    id = MLX5_GET(set_flow_table_root_in, in, table_id);
++    if (MLX5_GET(set_flow_table_root_in, in, table_type) == MLX5_FT_NIC_RX) {
++        s->rx_root_ft = id;
++        s->rx_root_valid = true;
++        trace_mlx5_flow_root(id);
++    }
++    return MLX5_CMD_STAT_OK;
++}
++
++int mlx5_cmd_create_flow_group(MLX5State *s, const uint8_t *in,
++                               uint32_t inlen, uint8_t *out, uint32_t outlen)
++{
++    MLX5FlowTable *ft;
++    MLX5FlowGroup *fg;
++    uint32_t id;
++
++    MLX5_CMD_CHECK_LEN(create_flow_group_in, create_flow_group_out);
++    ft = mlx5_flow_table_get(s, MLX5_GET(create_flow_group_in, in, table_id));
++    if (!ft) {
++        return MLX5_CMD_STAT_BAD_RES_ERR;
++    }
++    fg = g_new0(MLX5FlowGroup, 1);
++    fg->criteria_enable = MLX5_GET(create_flow_group_in, in,
++                                   match_criteria_enable);
++    memcpy(fg->mask, MLX5_ADDR_OF(create_flow_group_in, in, match_criteria),
++           sizeof(fg->mask));
++    id = mlx5_alloc_id(s);
++    g_hash_table_insert(ft->groups, GUINT_TO_POINTER(id), fg);
++    MLX5_SET(create_flow_group_out, out, group_id, id);
++    return MLX5_CMD_STAT_OK;
++}
++
++int mlx5_cmd_destroy_flow_group(MLX5State *s, const uint8_t *in,
++                                uint32_t inlen, uint8_t *out, uint32_t outlen)
++{
++    MLX5FlowTable *ft;
++
++    MLX5_CMD_CHECK_LEN(destroy_flow_group_in, destroy_flow_group_out);
++    ft = mlx5_flow_table_get(s, MLX5_GET(destroy_flow_group_in, in,
++                                         table_id));
++    if (!ft || !g_hash_table_remove(ft->groups, GUINT_TO_POINTER(
++                    MLX5_GET(destroy_flow_group_in, in, group_id)))) {
++        return MLX5_CMD_STAT_BAD_RES_ERR;
++    }
++    return MLX5_CMD_STAT_OK;
++}
++
++/* Creates an entry or, with op_mod 1, replaces an existing one. */
++int mlx5_cmd_set_fte(MLX5State *s, const uint8_t *in, uint32_t inlen,
++                     uint8_t *out, uint32_t outlen)
++{
++    const uint8_t *ctx, *dest;
++    MLX5FlowTable *ft;
++    MLX5Fte *fte;
++    uint32_t index, i;
++
++    MLX5_CMD_CHECK_LEN(set_fte_in, set_fte_out);
++    ft = mlx5_flow_table_get(s, MLX5_GET(set_fte_in, in, table_id));
++    if (!ft) {
++        return MLX5_CMD_STAT_BAD_RES_ERR;
++    }
++    index = MLX5_GET(set_fte_in, in, flow_index);
++    ctx = MLX5_ADDR_OF(set_fte_in, in, flow_context);
++    dest = MLX5_ADDR_OF(flow_context, ctx, destination);
++
++    fte = g_new0(MLX5Fte, 1);
++    fte->group_id = MLX5_GET(flow_context, ctx, group_id);
++    fte->action = MLX5_GET(flow_context, ctx, action);
++    fte->flow_tag = MLX5_GET(flow_context, ctx, flow_tag);
++    fte->ndests = MLX5_GET(flow_context, ctx, destination_list_size);
++    memcpy(fte->value, MLX5_ADDR_OF(flow_context, ctx, match_value),
++           sizeof(fte->value));
++    if (!(fte->action & MLX5_FLOW_CONTEXT_ACTION_FWD_DEST)) {
++        fte->ndests = 0;
++    }
++    if (fte->ndests > (in + inlen - dest) /
++                      MLX5_ST_SZ_BYTES(dest_format_struct)) {
++        g_free(fte);
++        return MLX5_CMD_STAT_BAD_INP_LEN_ERR;
++    }
++    fte->dests = g_new(MLX5FlowDest, fte->ndests);
++    for (i = 0; i < fte->ndests; i++) {
++        fte->dests[i].type = MLX5_GET(dest_format_struct, dest,
++                                      destination_type);
++        fte->dests[i].id = MLX5_GET(dest_format_struct, dest, destination_id);
++        dest += MLX5_ST_SZ_BYTES(dest_format_struct);
++    }
++    trace_mlx5_set_fte(MLX5_GET(set_fte_in, in, table_id), index,
++                       fte->group_id, fte->action, fte->ndests,
++                       fte->ndests ? fte->dests[0].type : 0,
++                       fte->ndests ? fte->dests[0].id : 0);
++    g_tree_replace(ft->ftes, GUINT_TO_POINTER(index), fte);
++    return MLX5_CMD_STAT_OK;
++}
++
++int mlx5_cmd_delete_fte(MLX5State *s, const uint8_t *in, uint32_t inlen,
++                        uint8_t *out, uint32_t outlen)
++{
++    MLX5FlowTable *ft;
++
++    MLX5_CMD_CHECK_LEN(delete_fte_in, delete_fte_out);
++    ft = mlx5_flow_table_get(s, MLX5_GET(delete_fte_in, in, table_id));
++    if (!ft || !g_tree_remove(ft->ftes, GUINT_TO_POINTER(
++                    MLX5_GET(delete_fte_in, in, flow_index)))) {
++        return MLX5_CMD_STAT_BAD_RES_ERR;
++    }
++    return MLX5_CMD_STAT_OK;
++}
++
++static void mlx5_tir_set_hash(MLX5Tir *tir, const uint8_t *tirc)
++{
++    const uint8_t *sel = MLX5_ADDR_OF(tirc, tirc,
++                                      rx_hash_field_selector_outer);
++
++    tir->hash_fn = MLX5_GET(tirc, tirc, rx_hash_fn);
++    tir->hash_symmetric = MLX5_GET(tirc, tirc, rx_hash_symmetric);
++    memcpy(tir->hash_key, MLX5_ADDR_OF(tirc, tirc, rx_hash_toeplitz_key),
++           sizeof(tir->hash_key));
++    tir->hash_l3_type = MLX5_GET(rx_hash_field_select, sel, l3_prot_type);
++    tir->hash_l4_type = MLX5_GET(rx_hash_field_select, sel, l4_prot_type);
++    tir->hash_fields = MLX5_GET(rx_hash_field_select, sel, selected_fields);
++}
++
++int mlx5_cmd_create_tir(MLX5State *s, const uint8_t *in, uint32_t inlen,
++                        uint8_t *out, uint32_t outlen)
++{
++    const uint8_t *tirc;
++    MLX5Tir *tir;
++
++    MLX5_CMD_CHECK_LEN(create_tir_in, create_tir_out);
++    tirc = MLX5_ADDR_OF(create_tir_in, in, ctx);
++    tir = g_new0(MLX5Tir, 1);
++    tir->tirn = mlx5_alloc_id(s);
++    tir->indirect = MLX5_GET(tirc, tirc, disp_type) ==
++                    MLX5_TIRC_DISP_TYPE_INDIRECT;
++    tir->inline_rqn = MLX5_GET(tirc, tirc, inline_rqn);
++    tir->rqtn = MLX5_GET(tirc, tirc, indirect_table);
++    tir->self_lb = MLX5_GET(tirc, tirc, self_lb_block);
++    mlx5_tir_set_hash(tir, tirc);
++    g_hash_table_insert(s->tirs, GUINT_TO_POINTER(tir->tirn), tir);
++    trace_mlx5_tir(tir->tirn, tir->indirect,
++                   tir->indirect ? tir->rqtn : tir->inline_rqn, tir->hash_fn,
++                   tir->hash_fields);
++    MLX5_SET(create_tir_out, out, tirn, tir->tirn);
++    return MLX5_CMD_STAT_OK;
++}
++
++int mlx5_cmd_modify_tir(MLX5State *s, const uint8_t *in, uint32_t inlen,
++                        uint8_t *out, uint32_t outlen)
++{
++    const uint8_t *tirc;
++    MLX5Tir *tir;
++
++    MLX5_CMD_CHECK_LEN(modify_tir_in, modify_tir_out);
++    tir = g_hash_table_lookup(s->tirs, GUINT_TO_POINTER(
++                                  MLX5_GET(modify_tir_in, in, tirn)));
++    if (!tir) {
++        return MLX5_CMD_STAT_BAD_RES_ERR;
++    }
++    tirc = MLX5_ADDR_OF(modify_tir_in, in, ctx);
++    if (MLX5_GET(modify_tir_in, in, bitmask.self_lb_en)) {
++        tir->self_lb = MLX5_GET(tirc, tirc, self_lb_block);
++    }
++    if (MLX5_GET(modify_tir_in, in, bitmask.hash)) {
++        mlx5_tir_set_hash(tir, tirc);
++        trace_mlx5_tir(tir->tirn, tir->indirect,
++                       tir->indirect ? tir->rqtn : tir->inline_rqn,
++                       tir->hash_fn, tir->hash_fields);
++    }
++    return MLX5_CMD_STAT_OK;
++}
++
++int mlx5_cmd_destroy_tir(MLX5State *s, const uint8_t *in, uint32_t inlen,
++                         uint8_t *out, uint32_t outlen)
++{
++    MLX5_CMD_CHECK_LEN(destroy_tir_in, destroy_tir_out);
++    if (!g_hash_table_remove(s->tirs, GUINT_TO_POINTER(
++                                 MLX5_GET(destroy_tir_in, in, tirn)))) {
++        return MLX5_CMD_STAT_BAD_RES_ERR;
++    }
++    return MLX5_CMD_STAT_OK;
++}
++
++/*
++ * Classification
++ */
++
++/* Lay a frame's headers out the way flow table entries describe them. */
++static void mlx5_match_image(const uint8_t *buf, const MLX5PktInfo *pi,
++                             uint8_t *img)
++{
++    const uint8_t *ip = buf + pi->l3_off;
++    const uint8_t *l4h = buf + pi->l4_off;
++    uint16_t outer = lduw_be_p(buf + 12);
++
++    memset(img, 0, MLX5_MATCH_SIZE);
++    memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, img, dmac_47_16), buf,
++           ETH_ALEN);
++    memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, img, smac_47_16),
++           buf + ETH_ALEN, ETH_ALEN);
++    /* The type that follows any VLAN tags. */
++    MLX5_SET(fte_match_set_lyr_2_4, img, ethertype, pi->ethertype);
++    if (pi->l3_off > ETH_HLEN) {
++        uint16_t tci = lduw_be_p(buf + 14);
++
++        MLX5_SET(fte_match_set_lyr_2_4, img, cvlan_tag, outer == ETH_P_VLAN);
++        MLX5_SET(fte_match_set_lyr_2_4, img, svlan_tag, outer == ETH_P_DVLAN);
++        MLX5_SET(fte_match_set_lyr_2_4, img, first_prio, tci >> 13);
++        MLX5_SET(fte_match_set_lyr_2_4, img, first_cfi, (tci >> 12) & 1);
++        MLX5_SET(fte_match_set_lyr_2_4, img, first_vid, tci & 0xfff);
++    }
++
++    if (pi->l3_type == MLX5_CQE_L3_HDR_TYPE_IPV4) {
++        MLX5_SET(fte_match_set_lyr_2_4, img, ip_version, 4);
++        MLX5_SET(fte_match_set_lyr_2_4, img, ipv4_ihl, ip[0] & 0xf);
++        MLX5_SET(fte_match_set_lyr_2_4, img, ip_dscp, ip[1] >> 2);
++        MLX5_SET(fte_match_set_lyr_2_4, img, ip_ecn, ip[1] & 3);
++        MLX5_SET(fte_match_set_lyr_2_4, img, ttl_hoplimit, ip[8]);
++        /* IPv4 addresses occupy the last four bytes of the address field. */
++        memcpy((uint8_t *)MLX5_ADDR_OF(fte_match_set_lyr_2_4, img,
++                                       src_ipv4_src_ipv6) + 12, ip + 12, 4);
++        memcpy((uint8_t *)MLX5_ADDR_OF(fte_match_set_lyr_2_4, img,
++                                       dst_ipv4_dst_ipv6) + 12, ip + 16, 4);
++    } else if (pi->l3_type == MLX5_CQE_L3_HDR_TYPE_IPV6) {
++        uint8_t tclass = (lduw_be_p(ip) >> 4) & 0xff;
++
++        MLX5_SET(fte_match_set_lyr_2_4, img, ip_version, 6);
++        MLX5_SET(fte_match_set_lyr_2_4, img, ip_dscp, tclass >> 2);
++        MLX5_SET(fte_match_set_lyr_2_4, img, ip_ecn, tclass & 3);
++        MLX5_SET(fte_match_set_lyr_2_4, img, ttl_hoplimit, ip[7]);
++        memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, img, src_ipv4_src_ipv6),
++               ip + 8, 16);
++        memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, img, dst_ipv4_dst_ipv6),
++               ip + 24, 16);
++    } else {
++        return;
++    }
++    MLX5_SET(fte_match_set_lyr_2_4, img, ip_protocol, pi->ip_proto);
++    MLX5_SET(fte_match_set_lyr_2_4, img, frag, pi->fragment);
++
++    if (pi->l4_proto == IP_PROTO_TCP) {
++        MLX5_SET(fte_match_set_lyr_2_4, img, tcp_sport, lduw_be_p(l4h));
++        MLX5_SET(fte_match_set_lyr_2_4, img, tcp_dport, lduw_be_p(l4h + 2));
++        MLX5_SET(fte_match_set_lyr_2_4, img, tcp_flags,
++                 lduw_be_p(l4h + 12) & 0x1ff);
++    } else if (pi->l4_proto == IP_PROTO_UDP) {
++        MLX5_SET(fte_match_set_lyr_2_4, img, udp_sport, lduw_be_p(l4h));
++        MLX5_SET(fte_match_set_lyr_2_4, img, udp_dport, lduw_be_p(l4h + 2));
++    }
++}
++
++typedef struct MLX5FteLookup {
++    const MLX5FlowTable *ft;
++    const uint8_t *img;
++    const MLX5Fte *hit;
++} MLX5FteLookup;
++
++static gboolean mlx5_fte_match(gpointer key, gpointer value, gpointer data)
++{
++    MLX5FteLookup *lookup = data;
++    const MLX5Fte *fte = value;
++    const MLX5FlowGroup *fg = g_hash_table_lookup(
++        lookup->ft->groups, GUINT_TO_POINTER(fte->group_id));
++    unsigned sec, i;
++
++    if (!fg) {
++        return FALSE;
++    }
++    for (sec = 0; sec < MLX5_MATCH_SECTIONS; sec++) {
++        size_t off = sec * MLX5_MATCH_SECTION_SIZE;
++
++        if (!(fg->criteria_enable & (1u << sec))) {
++            continue;
++        }
++        for (i = 0; i < MLX5_MATCH_SECTION_SIZE; i++) {
++            if ((lookup->img[off + i] ^ fte->value[off + i]) &
++                fg->mask[off + i]) {
++                return FALSE;
++            }
++        }
++    }
++    lookup->hit = fte;
++    return TRUE;    /* stop: entries are visited in index order */
++}
++
++static uint32_t mlx5_toeplitz(const uint8_t *key, size_t key_len,
++                              const uint8_t *data, size_t len)
++{
++    uint32_t window = ldl_be_p(key);
++    uint32_t hash = 0;
++    size_t i;
++    int bit;
++
++    for (i = 0; i < len; i++) {
++        for (bit = 7; bit >= 0; bit--) {
++            if (data[i] & (1 << bit)) {
++                hash ^= window;
++            }
++            window <<= 1;
++            if (i + 4 < key_len && (key[i + 4] & (1 << bit))) {
++                window |= 1;
++            }
++        }
++    }
++    return hash;
++}
++
++/* Append a (source, destination) pair of hash fields. */
++static size_t mlx5_hash_pair(uint8_t *in, const uint8_t *src,
++                             const uint8_t *dst, size_t len, bool want_src,
++                             bool want_dst, bool symmetric)
++{
++    size_t n = 0, i;
++
++    if (symmetric && want_src && want_dst) {
++        /* Direction independent: OR of the pair, then XOR of the pair. */
++        for (i = 0; i < len; i++) {
++            in[i] = src[i] | dst[i];
++            in[len + i] = src[i] ^ dst[i];
++        }
++        return 2 * len;
++    }
++    if (want_src) {
++        memcpy(in, src, len);
++        n += len;
++    }
++    if (want_dst) {
++        memcpy(in + n, dst, len);
++        n += len;
++    }
++    return n;
++}
++
++/* RSS hash of the fields a TIR selects, where the frame has them. */
++static uint32_t mlx5_tir_hash(const MLX5Tir *tir, const uint8_t *buf,
++                              const MLX5PktInfo *pi, uint8_t *hash_type)
++{
++    const uint8_t *ip = buf + pi->l3_off;
++    const uint8_t *l4h = buf + pi->l4_off;
++    bool v6 = pi->l3_type == MLX5_CQE_L3_HDR_TYPE_IPV6;
++    uint32_t fields = tir->hash_fields;
++    uint8_t in[2 * 16 + 2 * 2];
++    size_t len = 0;
++    unsigned i;
++    uint8_t x;
++
++    *hash_type = 0;
++    if (tir->hash_fn == MLX5_RX_HASH_FN_NONE || !pi->l3_type ||
++        v6 != (tir->hash_l3_type == MLX5_L3_PROT_TYPE_IPV6)) {
++        return 0;
++    }
++    if (fields & (MLX5_HASH_FIELD_SEL_SRC_IP | MLX5_HASH_FIELD_SEL_DST_IP)) {
++        len += mlx5_hash_pair(in, ip + (v6 ? 8 : 12), ip + (v6 ? 24 : 16),
++                              v6 ? 16 : 4,
++                              fields & MLX5_HASH_FIELD_SEL_SRC_IP,
++                              fields & MLX5_HASH_FIELD_SEL_DST_IP,
++                              tir->hash_symmetric);
++        *hash_type |= v6 ? MLX5_CQE_RSS_IPV6 : MLX5_CQE_RSS_IPV4;
++    }
++    if ((fields & (MLX5_HASH_FIELD_SEL_L4_SPORT |
++                   MLX5_HASH_FIELD_SEL_L4_DPORT)) &&
++        pi->l4_proto == (tir->hash_l4_type == MLX5_L4_PROT_TYPE_UDP ?
++                         IP_PROTO_UDP : IP_PROTO_TCP)) {
++        len += mlx5_hash_pair(in + len, l4h, l4h + 2, 2,
++                              fields & MLX5_HASH_FIELD_SEL_L4_SPORT,
++                              fields & MLX5_HASH_FIELD_SEL_L4_DPORT,
++                              tir->hash_symmetric);
++        *hash_type |= pi->l4_proto == IP_PROTO_UDP ? MLX5_CQE_RSS_L4_UDP :
++                                                     MLX5_CQE_RSS_L4_TCP;
++    }
++
++    if (tir->hash_fn == MLX5_RX_HASH_FN_TOEPLITZ) {
++        return mlx5_toeplitz(tir->hash_key, sizeof(tir->hash_key), in, len);
++    }
++    for (x = 0, i = 0; i < len; i++) {
++        x ^= in[i];
++    }
++    return (uint8_t)~x;
++}
++
++static void mlx5_tir_target(MLX5State *s, uint32_t tirn, uint32_t flow_tag,
++                            const uint8_t *buf, const MLX5PktInfo *pi,
++                            MLX5RxTarget *targets, unsigned *n)
++{
++    const MLX5Tir *tir = g_hash_table_lookup(s->tirs,
++                                             GUINT_TO_POINTER(tirn));
++    MLX5RxTarget *t;
++
++    if (!tir || *n >= MLX5_RX_MAX_TARGETS) {
++        return;
++    }
++    t = &targets[*n];
++    t->flow_tag = flow_tag;
++    t->hash = mlx5_tir_hash(tir, buf, pi, &t->hash_type);
++    if (tir->indirect) {
++        const MLX5Rqt *rqt = g_hash_table_lookup(s->rqts,
++                                                 GUINT_TO_POINTER(tir->rqtn));
++
++        if (!rqt || !rqt->size) {
++            return;
++        }
++        t->rqn = rqt->rqns[t->hash % rqt->size];
++    } else {
++        t->rqn = tir->inline_rqn;
++    }
++    (*n)++;
++}
++
++static void mlx5_fs_walk(MLX5State *s, uint32_t table_id, const uint8_t *img,
++                         const uint8_t *buf, const MLX5PktInfo *pi,
++                         MLX5RxTarget *targets, unsigned *n, unsigned depth)
++{
++    while (depth++ < MLX5_FS_MAX_DEPTH) {
++        MLX5FteLookup lookup = { .img = img };
++        const MLX5Fte *fte;
++        uint32_t i;
++
++        lookup.ft = mlx5_flow_table_get(s, table_id);
++        if (!lookup.ft) {
++            return;
++        }
++        g_tree_foreach(lookup.ft->ftes, mlx5_fte_match, &lookup);
++        fte = lookup.hit;
++        trace_mlx5_fs_lookup(table_id, fte != NULL, fte ? fte->action : 0);
++
++        if (!fte || !(fte->action & (MLX5_FLOW_CONTEXT_ACTION_DROP |
++                                     MLX5_FLOW_CONTEXT_ACTION_FWD_DEST))) {
++            if (!lookup.ft->miss_fwd) {
++                return;
++            }
++            table_id = lookup.ft->miss_table_id;
++            continue;
++        }
++        if (fte->action & MLX5_FLOW_CONTEXT_ACTION_DROP) {
++            return;
++        }
++        for (i = 0; i < fte->ndests; i++) {
++            switch (fte->dests[i].type) {
++            case MLX5_IFC_FLOW_DESTINATION_TYPE_TIR:
++                mlx5_tir_target(s, fte->dests[i].id, fte->flow_tag, buf, pi,
++                                targets, n);
++                break;
++            case MLX5_IFC_FLOW_DESTINATION_TYPE_FLOW_TABLE:
++                mlx5_fs_walk(s, fte->dests[i].id, img, buf, pi, targets, n,
++                             depth);
++                break;
++            default:
++                break;
++            }
++        }
++        return;
++    }
++}
++
++/*
++ * Find the receive queues a frame goes to.  Returns false if the driver has
++ * not set up receive steering at all.
++ */
++bool mlx5_fs_classify(MLX5State *s, const uint8_t *buf,
++                      const MLX5PktInfo *pi, MLX5RxTarget *targets,
++                      unsigned *n)
++{
++    uint8_t img[MLX5_MATCH_SIZE];
++
++    *n = 0;
++    if (!s->rx_root_valid) {
++        return false;
++    }
++    mlx5_match_image(buf, pi, img);
++    mlx5_fs_walk(s, s->rx_root_ft, img, buf, pi, targets, n, 0);
++    return true;
++}
++
++/* Self-loopback flags (MLX5_TIRC_SELF_LB_BLOCK_*) enabled on any TIR. */
++unsigned mlx5_fs_self_lb(MLX5State *s)
++{
++    GHashTableIter iter;
++    gpointer value;
++    unsigned flags = 0;
++
++    g_hash_table_iter_init(&iter, s->tirs);
++    while (g_hash_table_iter_next(&iter, NULL, &value)) {
++        flags |= ((MLX5Tir *)value)->self_lb;
++    }
++    return flags;
++}
++
++void mlx5_fs_reset(MLX5State *s)
++{
++    g_hash_table_remove_all(s->flow_tables);
++    g_hash_table_remove_all(s->tirs);
++    s->rx_root_valid = false;
++}
++
++void mlx5_fs_init(MLX5State *s)
++{
++    s->flow_tables = g_hash_table_new_full(NULL, NULL, NULL,
++                                           mlx5_flow_table_free);
++    s->tirs = g_hash_table_new_full(NULL, NULL, NULL, g_free);
++}
++
++void mlx5_fs_cleanup(MLX5State *s)
++{
++    g_hash_table_destroy(s->flow_tables);
++    g_hash_table_destroy(s->tirs);
++}
+diff --git a/hw/net/mlx5/mlx5_hw.h b/hw/net/mlx5/mlx5_hw.h
+index c5494da..e94a68b 100644
+--- a/hw/net/mlx5/mlx5_hw.h
++++ b/hw/net/mlx5/mlx5_hw.h
+@@ -324,6 +324,21 @@ enum {
+     MLX5_CQE_RSS_L4_UDP     = 0x2 << 6,
+ };
+ 
++/* TIR RSS hash field selection (rx_hash_field_select) */
++enum {
++    MLX5_L3_PROT_TYPE_IPV4      = 0,
++    MLX5_L3_PROT_TYPE_IPV6      = 1,
++    MLX5_L4_PROT_TYPE_TCP       = 0,
++    MLX5_L4_PROT_TYPE_UDP       = 1,
++};
++
++enum {
++    MLX5_HASH_FIELD_SEL_SRC_IP      = 1 << 0,
++    MLX5_HASH_FIELD_SEL_DST_IP      = 1 << 1,
++    MLX5_HASH_FIELD_SEL_L4_SPORT    = 1 << 2,
++    MLX5_HASH_FIELD_SEL_L4_DPORT    = 1 << 3,
++};
++
+ /* Send work queue entries are built from 16-byte segments. */
+ #define MLX5_SEND_WQE_BB        64
+ #define MLX5_SEND_WQE_DS        16
+diff --git a/hw/net/trace-events b/hw/net/trace-events
+index b2fc0bf..8f1391b 100644
+--- a/hw/net/trace-events
++++ b/hw/net/trace-events
+@@ -544,12 +544,20 @@ mlx5_create_rq(uint32_t rqn, uint32_t cqn, uint8_t type, uint8_t log_size, uint8
+ mlx5_modify_rq(uint32_t rqn, uint8_t state, bool vlan_strip) "rqn 0x%x state %u vlan_strip %d"
+ mlx5_set_rqt(uint32_t rqtn, uint32_t size, uint32_t first) "rqtn 0x%x size %u first rqn 0x%x"
+ 
++# mlx5/mlx5_fs.c
++mlx5_flow_table(uint32_t id, uint8_t type, bool miss_fwd, uint32_t miss_id) "table 0x%x type %u miss forward %d to table 0x%x"
++mlx5_flow_root(uint32_t id) "receive root table 0x%x"
++mlx5_set_fte(uint32_t table, uint32_t index, uint32_t group, uint32_t action, uint32_t ndests, uint8_t dest_type, uint32_t dest_id) "table 0x%x index %u group 0x%x action 0x%x %u destination(s), first type %u id 0x%x"
++mlx5_tir(uint32_t tirn, bool indirect, uint32_t target, uint8_t hash_fn, uint32_t fields) "tirn 0x%x indirect %d rqt/rq 0x%x hash fn %u fields 0x%x"
++mlx5_fs_lookup(uint32_t table, bool hit, uint32_t action) "table 0x%x hit %d action 0x%x"
++
+ # mlx5/mlx5_dp.c
+ mlx5_eq_post(uint32_t eqn, uint8_t type, uint8_t sub_type, uint32_t pi, bool irq) "eqn %u type 0x%x sub_type 0x%x pi %u irq %d"
+ mlx5_eq_doorbell(uint32_t eqn, uint32_t ci, bool arm, uint32_t pi) "eqn %u ci %u arm %d pi %u"
+ mlx5_cq_post(uint32_t cqn, uint32_t pi, uint8_t opcode, uint16_t wqe_counter, uint64_t ts) "cqn 0x%x pi %u opcode %u wqe_counter %u timestamp %"PRIu64
+ mlx5_cq_doorbell(uint32_t cqn, uint32_t ci, uint32_t pi) "cqn 0x%x ci %u pi %u"
+ mlx5_tx(uint32_t sqn, uint16_t cc, uint8_t opcode, uint8_t ds) "sqn 0x%x wqe counter %u opcode 0x%x ds %u"
++mlx5_send(size_t len, bool looped) "len %zu looped back %d"
+ mlx5_rx(uint32_t rqn, uint16_t wqe_counter, size_t len) "rqn 0x%x wqe counter %u len %zu"
+ mlx5_rx_drop(const char *reason, size_t len) "%s (len %zu)"
+ mlx5_port_event(bool up) "link up %d"

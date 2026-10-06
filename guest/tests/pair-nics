@@ -1,0 +1,7 @@
+#!/bin/sh
+# Print QEMU arguments for two mlx5 ports wired back to back through a hub.
+echo "-device pcie-root-port,id=rp0,chassis=1" \
+     "-device pcie-root-port,id=rp1,chassis=2" \
+     "-netdev hubport,id=h0,hubid=0 -netdev hubport,id=h1,hubid=0" \
+     "-device mlx5,id=port0,netdev=h0,bus=rp0,mac=52:54:00:c5:00:01" \
+     "-device mlx5,id=port1,netdev=h1,bus=rp1,mac=52:54:00:c5:00:02"

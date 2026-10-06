@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Broyojo <dha@xoba.com>
+Date: Tue, 6 Oct 2026 15:42:06 -0400
+Subject: [PATCH 3/3] hw/net/mlx5: 64 MSI-X vectors, port vs. vport counters,
+ named traces
+
+Default to the 64 MSI-X vectors a ConnectX-5 has, so the driver can open
+a channel per CPU.  Count frames arriving on the port separately from
+frames flow steering passed to a receive queue, and report the former in
+the IEEE 802.3 port counters.  Tag data path traces with the device id.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DntkPG3Xz6WwgDaRoET5gX
+---
+ hw/net/mlx5/mlx5.c     |  7 ++++---
+ hw/net/mlx5/mlx5.h     |  7 ++++++-
+ hw/net/mlx5/mlx5_cmd.c |  4 ++--
+ hw/net/mlx5/mlx5_dp.c  | 22 ++++++++++++++++------
+ hw/net/trace-events    |  6 +++---
+ 5 files changed, 31 insertions(+), 15 deletions(-)
+
+diff --git a/hw/net/mlx5/mlx5.c b/hw/net/mlx5/mlx5.c
+index 9f96281..5cd65ad 100644
+--- a/hw/net/mlx5/mlx5.c
++++ b/hw/net/mlx5/mlx5.c
+@@ -288,8 +288,9 @@ static void mlx5_realize(PCIDevice *pci_dev, Error **errp)
+     MLX5State *s = MLX5(pci_dev);
+     unsigned i;
+ 
+-    if (s->num_vectors < 2 || s->num_vectors > MLX5_MAX_EQS) {
+-        error_setg(errp, "vectors must be between 2 and %d", MLX5_MAX_EQS);
++    if (s->num_vectors < 2 || s->num_vectors > MLX5_MAX_VECTORS) {
++        error_setg(errp, "vectors must be between 2 and %d",
++                   MLX5_MAX_VECTORS);
+         return;
+     }
+     if (!s->freq_khz) {
+@@ -384,7 +385,7 @@ static const VMStateDescription mlx5_vmstate = {
+ 
+ static const Property mlx5_properties[] = {
+     DEFINE_NIC_PROPERTIES(MLX5State, conf),
+-    DEFINE_PROP_UINT32("vectors", MLX5State, num_vectors, 9),
++    DEFINE_PROP_UINT32("vectors", MLX5State, num_vectors, MLX5_MAX_VECTORS),
+     DEFINE_PROP_UINT32("freq-khz", MLX5State, freq_khz, 1000000),
+     DEFINE_PROP_UINT32("speed", MLX5State, link_speed, 100000),
+     DEFINE_PROP_UINT16("device-id", MLX5State, device_id, 0x1017),
+diff --git a/hw/net/mlx5/mlx5.h b/hw/net/mlx5/mlx5.h
+index 15f8540..9600972 100644
+--- a/hw/net/mlx5/mlx5.h
++++ b/hw/net/mlx5/mlx5.h
+@@ -26,7 +26,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(MLX5State, MLX5)
+ #define MLX5_CMDQ_LOG_STRIDE        6
+ #define MLX5_CMD_MAX_LEN            (4 * MiB)
+ 
+-#define MLX5_MAX_EQS                64
++#define MLX5_MAX_EQS                128
++#define MLX5_MAX_VECTORS            64
+ 
+ /*
+  * With flow control on, a frame that finds its receive queue empty is held
+@@ -140,6 +141,10 @@ typedef struct MLX5RxTarget {
+ #define MLX5_RX_MAX_TARGETS         8
+ 
+ typedef struct MLX5Stats {
++    /* everything that arrived on the port */
++    uint64_t rx_phy_packets;
++    uint64_t rx_phy_bytes;
++    /* what flow steering passed on to a receive queue */
+     uint64_t rx_packets;
+     uint64_t rx_bytes;
+     uint64_t rx_bcast_packets;
+diff --git a/hw/net/mlx5/mlx5_cmd.c b/hw/net/mlx5/mlx5_cmd.c
+index 22b56c1..ec9b161 100644
+--- a/hw/net/mlx5/mlx5_cmd.c
++++ b/hw/net/mlx5/mlx5_cmd.c
+@@ -915,9 +915,9 @@ static void mlx5_reg_ppcnt(MLX5State *s, uint8_t *data)
+         return;
+     }
+     PPCNT_SET(data, a_frames_transmitted_ok, st->tx_packets);
+-    PPCNT_SET(data, a_frames_received_ok, st->rx_packets);
++    PPCNT_SET(data, a_frames_received_ok, st->rx_phy_packets);
+     PPCNT_SET(data, a_octets_transmitted_ok, st->tx_bytes);
+-    PPCNT_SET(data, a_octets_received_ok, st->rx_bytes);
++    PPCNT_SET(data, a_octets_received_ok, st->rx_phy_bytes);
+     PPCNT_SET(data, a_multicast_frames_xmitted_ok, st->tx_mcast_packets);
+     PPCNT_SET(data, a_broadcast_frames_xmitted_ok, st->tx_bcast_packets);
+     PPCNT_SET(data, a_multicast_frames_received_ok, st->rx_mcast_packets);
+diff --git a/hw/net/mlx5/mlx5_dp.c b/hw/net/mlx5/mlx5_dp.c
+index 2454bc5..8683b55 100644
+--- a/hw/net/mlx5/mlx5_dp.c
++++ b/hw/net/mlx5/mlx5_dp.c
+@@ -82,6 +82,12 @@ static void mlx5_parse_pkt(const uint8_t *buf, size_t len, MLX5PktInfo *pi)
+     }
+ }
+ 
++/* Name to tell devices apart in traces: the id given on the command line. */
++static const char *mlx5_name(MLX5State *s)
++{
++    return DEVICE(s)->id ?: "mlx5";
++}
++
+ /* Fold a 32-bit ones' complement accumulator down to 16 bits. */
+ static uint16_t mlx5_csum_fold(uint32_t sum)
+ {
+@@ -390,11 +396,11 @@ static void mlx5_send(MLX5State *s, const uint8_t *buf, size_t len)
+     } else if ((lb & MLX5_TIRC_SELF_LB_BLOCK_BLOCK_UNICAST) &&
+                (!memcmp(buf, s->conf.macaddr.a, ETH_ALEN) ||
+                 !memcmp(buf, s->tx_mac, ETH_ALEN))) {
+-        trace_mlx5_send(len, true);
++        trace_mlx5_send(mlx5_name(s), len, true);
+         mlx5_receive(s, buf, len);
+         return;
+     }
+-    trace_mlx5_send(len, false);
++    trace_mlx5_send(mlx5_name(s), len, false);
+     if (!is_multicast_ether_addr(src) && (src[0] | src[1] | src[2] | src[3] |
+                                           src[4] | src[5])) {
+         memcpy(s->tx_mac, src, ETH_ALEN);
+@@ -729,7 +735,8 @@ static bool mlx5_rq_fill(MLX5State *s, MLX5Rq *rq, const uint8_t *buf,
+         room += count;
+     }
+     if (size > room) {
+-        trace_mlx5_rx_drop("frame larger than receive buffer", size);
++        trace_mlx5_rx_drop(mlx5_name(s), "frame larger than receive buffer",
++                           size);
+         return false;
+     }
+ 
+@@ -801,7 +808,7 @@ static void mlx5_rx_deliver(MLX5State *s, const MLX5RxTarget *target,
+ 
+     if (!rq || !mlx5_rq_has_buffers(s, rq)) {
+         st->rx_out_of_buffer++;
+-        trace_mlx5_rx_drop("no receive buffer", size);
++        trace_mlx5_rx_drop(mlx5_name(s), "no receive buffer", size);
+         return;
+     }
+     cq = g_hash_table_lookup(s->cqs, GUINT_TO_POINTER(rq->cqn));
+@@ -864,7 +871,7 @@ static void mlx5_rx_deliver(MLX5State *s, const MLX5RxTarget *target,
+     }
+     mlx5_cqe_set_ts(&cqe, ts);
+ 
+-    trace_mlx5_rx(rq->rqn, wqe_counter, size);
++    trace_mlx5_rx(mlx5_name(s), rq->rqn, wqe_counter, size);
+     mlx5_cq_post(s, cq, &cqe);
+     s->rx_stalled = false;
+ 
+@@ -900,13 +907,16 @@ ssize_t mlx5_receive(MLX5State *s, const uint8_t *buf, size_t size)
+         size = ETH_ZLEN;
+     }
+ 
++    s->stats.rx_phy_packets++;
++    s->stats.rx_phy_bytes += size;
++
+     mlx5_parse_pkt(buf, size, &pi);
+     if (!mlx5_fs_classify(s, buf, &pi, targets, &n)) {
+         mlx5_default_target(s, buf, &pi, targets, &n);
+     }
+     if (!n) {
+         s->stats.rx_steer_missed++;
+-        trace_mlx5_rx_drop("no matching flow rule", size);
++        trace_mlx5_rx_drop(mlx5_name(s), "no matching flow rule", size);
+     } else if (mlx5_rx_hold(s, &targets[0])) {
+         /* Not consumed: the backend queues the frame until we flush. */
+         return 0;
+diff --git a/hw/net/trace-events b/hw/net/trace-events
+index 8f1391b..39d955c 100644
+--- a/hw/net/trace-events
++++ b/hw/net/trace-events
+@@ -557,7 +557,7 @@ mlx5_eq_doorbell(uint32_t eqn, uint32_t ci, bool arm, uint32_t pi) "eqn %u ci %u
+ mlx5_cq_post(uint32_t cqn, uint32_t pi, uint8_t opcode, uint16_t wqe_counter, uint64_t ts) "cqn 0x%x pi %u opcode %u wqe_counter %u timestamp %"PRIu64
+ mlx5_cq_doorbell(uint32_t cqn, uint32_t ci, uint32_t pi) "cqn 0x%x ci %u pi %u"
+ mlx5_tx(uint32_t sqn, uint16_t cc, uint8_t opcode, uint8_t ds) "sqn 0x%x wqe counter %u opcode 0x%x ds %u"
+-mlx5_send(size_t len, bool looped) "len %zu looped back %d"
+-mlx5_rx(uint32_t rqn, uint16_t wqe_counter, size_t len) "rqn 0x%x wqe counter %u len %zu"
+-mlx5_rx_drop(const char *reason, size_t len) "%s (len %zu)"
++mlx5_send(const char *dev, size_t len, bool looped) "%s: len %zu looped back %d"
++mlx5_rx(const char *dev, uint32_t rqn, uint16_t wqe_counter, size_t len) "%s: rqn 0x%x wqe counter %u len %zu"
++mlx5_rx_drop(const char *dev, const char *reason, size_t len) "%s: %s (len %zu)"
+ mlx5_port_event(bool up) "link up %d"

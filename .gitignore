@@ -1,0 +1,6 @@
+# QEMU checkout (scripts/build-qemu.sh) and kernel reference tree
+/qemu/
+/ref/
+# Guest kernel, initramfs and logs (guest/build-guest.sh, guest/run.sh)
+/guest/out/
+.DS_Store
