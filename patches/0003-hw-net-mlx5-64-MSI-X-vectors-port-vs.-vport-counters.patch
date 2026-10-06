@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Broyojo <dha@xoba.com>
 Date: Tue, 6 Oct 2026 15:42:06 -0400
-Subject: [PATCH 3/4] hw/net/mlx5: 64 MSI-X vectors, port vs. vport counters,
+Subject: [PATCH 3/6] hw/net/mlx5: 64 MSI-X vectors, port vs. vport counters,
  named traces
 
 Default to the 64 MSI-X vectors a ConnectX-5 has, so the driver can open

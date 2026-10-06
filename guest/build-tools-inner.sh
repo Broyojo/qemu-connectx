@@ -24,7 +24,7 @@ done
 st=/linux/tools/testing/selftests
 for t in net/txtimestamp net/timestamping net/hwtstamp_config \
          net/rxtimestamp net/udpgso_bench_tx net/udpgso_bench_rx \
-         ptp/testptp; do
+         net/toeplitz ptp/testptp; do
     gcc -O2 -static -I"$st" -o "$out/bin/$(basename "$t")" "$st/$t.c" \
         -lrt -lpthread
 done

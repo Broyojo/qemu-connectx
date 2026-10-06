@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Broyojo <dha@xoba.com>
 Date: Tue, 6 Oct 2026 15:59:06 -0400
-Subject: [PATCH 4/4] hw/net/mlx5: function-level reset, NIC interface disabled
+Subject: [PATCH 4/6] hw/net/mlx5: function-level reset, NIC interface disabled
  after reset
 
 Advertise and implement PCIe function-level reset.  After any reset,

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Broyojo <dha@xoba.com>
 Date: Tue, 6 Oct 2026 13:01:01 -0400
-Subject: [PATCH 1/4] hw/net: add Mellanox ConnectX-5 (mlx5) Ethernet device
+Subject: [PATCH 1/6] hw/net: add Mellanox ConnectX-5 (mlx5) Ethernet device
 
 Emulate an Ethernet-only ConnectX-5 that the Linux mlx5_core driver binds
 to unmodified.  The model covers:

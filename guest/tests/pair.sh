@@ -46,6 +46,64 @@ check "receive checksums verified by hardware" \
 # A sender can outrun the receiver, as on real hardware; just report it.
 echo "     receive buffer drops: eth0 $(stat eth0 rx_out_of_buffer)"
 
+# RSS hash: the kernel's toeplitz selftest compares the hash the port reports
+# for each frame with a software Toeplitz hash of the same addresses and
+# ports, using the key the driver programmed.
+toeplitz_ok() {
+    # toeplitz_ok <-u|-t> <-4|-6> <our address> <socat address prefix>
+    key=$(ethtool -x eth0 | sed -n '/RSS hash key/{n;p;}')
+    toeplitz "$2" "$1" -d 8000 -i eth0 -k "$key" -T 1500 -s \
+        >/tmp/toeplitz.out 2>&1 &
+    sleep 0.3
+    for i in $(seq 1 40); do
+        echo msg | ip netns exec peer socat -u STDIN "$4:$3:8000" 2>/dev/null
+    done
+    wait
+    cat /tmp/toeplitz.out
+    grep -q "pass=[1-9][0-9]* nohash=0 fail=0" /tmp/toeplitz.out
+}
+# The driver defaults to a symmetric variant; the reference is plain Toeplitz.
+check "plain Toeplitz RSS" ethtool -X eth0 xfrm none
+check "RSS hash matches Toeplitz (UDP/IPv4)" toeplitz_ok -u -4 10.9.0.1 UDP4
+check "RSS hash matches Toeplitz (TCP/IPv4)" toeplitz_ok -t -4 10.9.0.1 TCP4
+check "RSS hash matches Toeplitz (UDP/IPv6)" \
+    toeplitz_ok -u -6 "[fd00:9::1]" UDP6
+check "RSS hash matches Toeplitz (TCP/IPv6)" \
+    toeplitz_ok -t -6 "[fd00:9::1]" TCP6
+ethtool -X eth0 xfrm symmetric-or-xor
+
+# The data path modes a ConnectX-5 defaults to, and their fallbacks.
+flag() { ethtool --show-priv-flags eth0 | grep -q "^$1 *: $2"; }
+check "striding receive queue is the default" flag rx_striding_rq on
+check "multi-packet send is the default" flag skb_tx_mpwqe on
+check "TCP stream, striding RQ and multi-packet send" iperf
+check "switch to legacy receive queue" \
+    ethtool --set-priv-flags eth0 rx_striding_rq off
+check "TCP stream, legacy receive queue" iperf -R
+check "switch multi-packet send off" \
+    ethtool --set-priv-flags eth0 skb_tx_mpwqe off
+check "TCP stream, single-packet send" iperf
+ethtool --set-priv-flags eth0 rx_striding_rq on skb_tx_mpwqe on
+check "enable CQE compression" \
+    ethtool --set-priv-flags eth0 rx_cqe_compress on
+check "TCP stream, CQE compression allowed" iperf -R
+ethtool --set-priv-flags eth0 rx_cqe_compress off
+
+# Link mode selection, FEC and the cable's EEPROM.
+check "force 25G" ethtool -s eth0 speed 25000 autoneg off
+sleep 1
+check "link reports 25G" sh -c 'ethtool eth0 | grep -q "Speed: 25000Mb/s"'
+check "ping at 25G" ping -c 2 -W 2 10.9.0.2
+check "back to autonegotiation" ethtool -s eth0 autoneg on
+sleep 1
+check "link is back at 100G" sh -c 'ethtool eth0 | grep -q "Speed: 100000Mb/s"'
+check "RS-FEC active at 100G" \
+    sh -c 'ethtool --show-fec eth0 | grep -q "Active FEC encoding: RS"'
+check "module EEPROM decodes as QSFP28" \
+    sh -c 'ethtool -m eth0 | grep -q "Identifier.*QSFP28"'
+check "firmware version in devlink" sh -c \
+    'devlink dev info | grep -q "fw.version 16.35.4030"'
+
 # Receive flow steering.  Frames for someone else's address must be filtered
 # out by the port unless it is promiscuous.
 vport_rx() { stat eth0 rx_vport_unicast_packets; }

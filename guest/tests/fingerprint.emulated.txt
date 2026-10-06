@@ -1,0 +1,685 @@
+### driver
+driver: mlx5_core
+firmware-version: 16.35.4030 (QEMU0000000001)
+expansion-rom-version: 
+supports-statistics: yes
+supports-test: yes
+supports-eeprom-access: no
+supports-register-dump: no
+supports-priv-flags: yes
+
+### pci
+01:00.0 Ethernet controller [0200]: Mellanox Technologies MT27800 Family [ConnectX-5] [15b3:1017]
+	Region 0: Memory at <addr> (64-bit, prefetchable) [size=32M]
+	Capabilities:  MSI-X: Enable+ Count=64 Masked-
+	Capabilities:  Vendor Specific Information: Len=18 <?>
+	Capabilities:  Express (v2) Endpoint, IntMsgNum 0
+		DevCap:	MaxPayload 128 bytes, PhantFunc 0, Latency L0s <64ns, L1 <1us
+		LnkCap:	Port #0, Speed 8GT/s, Width x16, ASPM L0s, Exit Latency L0s <64ns
+		LnkSta:	Speed 8GT/s, Width x16
+	Capabilities:  Power Management version 3
+
+### link
+Settings for eth0:
+	Supported ports: [ Backplane ]
+	Supported link modes:   1000baseKX/Full
+	                        10000baseKR/Full
+	                        40000baseKR4/Full
+	                        40000baseCR4/Full
+	                        40000baseSR4/Full
+	                        40000baseLR4/Full
+	                        25000baseCR/Full
+	                        25000baseKR/Full
+	                        25000baseSR/Full
+	                        50000baseCR2/Full
+	                        50000baseKR2/Full
+	                        100000baseKR4/Full
+	                        100000baseSR4/Full
+	                        100000baseCR4/Full
+	                        100000baseLR4_ER4/Full
+	                        50000baseSR2/Full
+	Supported pause frame use: Symmetric
+	Supports auto-negotiation: Yes
+	Supported FEC modes: None	 RS	 BASER
+	Advertised link modes:  1000baseKX/Full
+	                        10000baseKR/Full
+	                        40000baseKR4/Full
+	                        40000baseCR4/Full
+	                        40000baseSR4/Full
+	                        40000baseLR4/Full
+	                        25000baseCR/Full
+	                        25000baseKR/Full
+	                        25000baseSR/Full
+	                        50000baseCR2/Full
+	                        50000baseKR2/Full
+	                        100000baseKR4/Full
+	                        100000baseSR4/Full
+	                        100000baseCR4/Full
+	                        100000baseLR4_ER4/Full
+	                        50000baseSR2/Full
+	Advertised pause frame use: Symmetric
+	Advertised auto-negotiation: Yes
+	Advertised FEC modes: RS
+	Link partner advertised link modes:  1000baseKX/Full
+	                                     10000baseKR/Full
+	                                     40000baseKR4/Full
+	                                     40000baseCR4/Full
+	                                     40000baseSR4/Full
+	                                     40000baseLR4/Full
+	                                     25000baseCR/Full
+	                                     25000baseKR/Full
+	                                     25000baseSR/Full
+	                                     50000baseCR2/Full
+	                                     50000baseKR2/Full
+	                                     100000baseKR4/Full
+	                                     100000baseSR4/Full
+	                                     100000baseCR4/Full
+	                                     100000baseLR4_ER4/Full
+	                                     50000baseSR2/Full
+	Link partner advertised pause frame use: No
+	Link partner advertised auto-negotiation: Yes
+	Link partner advertised FEC modes: Not reported
+	Speed: 100000Mb/s
+	Lanes: 4
+	Duplex: Full
+	Auto-negotiation: on
+	Port: Direct Attach Copper
+	PHYAD: 0
+	Transceiver: internal
+	Supports Wake-on: d
+	Wake-on: d
+
+### features
+Features for eth0:
+rx-checksumming: on
+tx-checksumming: on
+	tx-checksum-ipv4: off [fixed]
+	tx-checksum-ip-generic: on
+	tx-checksum-ipv6: off [fixed]
+	tx-checksum-fcoe-crc: off [fixed]
+	tx-checksum-sctp: off [fixed]
+scatter-gather: on
+	tx-scatter-gather: on
+	tx-scatter-gather-fraglist: off [fixed]
+tcp-segmentation-offload: on
+	tx-tcp-segmentation: on
+	tx-tcp-ecn-segmentation: off [fixed]
+	tx-tcp-mangleid-segmentation: off
+	tx-tcp6-segmentation: on
+	tx-tcp-accecn-segmentation: off [fixed]
+generic-segmentation-offload: on
+generic-receive-offload: on
+large-receive-offload: off [fixed]
+rx-vlan-offload: on
+tx-vlan-offload: on
+ntuple-filters: off
+receive-hashing: on
+highdma: on [fixed]
+rx-vlan-filter: on
+vlan-challenged: off [fixed]
+tx-gso-robust: off [fixed]
+tx-fcoe-segmentation: off [fixed]
+tx-gre-segmentation: off [fixed]
+tx-gre-csum-segmentation: off [fixed]
+tx-ipxip4-segmentation: off [fixed]
+tx-ipxip6-segmentation: off [fixed]
+tx-udp_tnl-segmentation: off [fixed]
+tx-udp_tnl-csum-segmentation: off [fixed]
+tx-gso-partial: on
+tx-tunnel-remcsum-segmentation: off [fixed]
+tx-sctp-segmentation: off [fixed]
+tx-esp-segmentation: off [fixed]
+tx-udp-segmentation: on
+tx-gso-list: off [fixed]
+tx-nocache-copy: off
+loopback: off [fixed]
+rx-fcs: off [fixed]
+rx-all: off [fixed]
+tx-vlan-stag-hw-insert: on
+rx-vlan-stag-hw-parse: off [fixed]
+rx-vlan-stag-filter: on [fixed]
+l2-fwd-offload: off [fixed]
+hw-tc-offload: off [fixed]
+esp-hw-offload: off [fixed]
+esp-tx-csum-hw-offload: off [fixed]
+rx-udp_tunnel-port-offload: off [fixed]
+tls-hw-tx-offload: off [fixed]
+tls-hw-rx-offload: off [fixed]
+rx-gro-hw: off [fixed]
+tls-hw-record: off [fixed]
+rx-gro-list: off
+macsec-hw-offload: off [fixed]
+rx-udp-gro-forwarding: off
+hsr-tag-ins-offload: off [fixed]
+hsr-tag-rm-offload: off [fixed]
+hsr-fwd-offload: off [fixed]
+hsr-dup-offload: off [fixed]
+
+### private flags
+Private flags for eth0:
+rx_cqe_moder       : off
+tx_cqe_moder       : off
+rx_cqe_compress    : off
+rx_striding_rq     : on
+rx_no_csum_complete: off
+xdp_tx_mpwqe       : on
+skb_tx_mpwqe       : on
+tx_port_ts         : off
+
+### rings
+Ring parameters for eth0:
+Pre-set maximums:
+RX:			8192
+RX Mini:		n/a
+RX Jumbo:		n/a
+TX:			8192
+TX push buff len:	n/a
+HDS thresh:		n/a
+Current hardware settings:
+RX:			1024
+RX Mini:		n/a
+RX Jumbo:		n/a
+TX:			1024
+RX Buf Len:		n/a
+CQE Size:		n/a
+TX Push:		off
+RX Push:		off
+TX push buff len:	n/a
+TCP data split:		n/a
+HDS thresh:		n/a
+
+### channels
+Channel parameters for eth0:
+Pre-set maximums:
+RX: <n>
+TX: <n>
+Other: <n>
+Combined: <n>
+Current hardware settings:
+RX: <n>
+TX: <n>
+Other: <n>
+Combined: <n>
+
+### coalescing
+Coalesce parameters for eth0:
+Adaptive RX: off  TX: off
+stats-block-usecs:	n/a
+sample-interval:	n/a
+pkt-rate-low:		n/a
+pkt-rate-high:		n/a
+
+rx-usecs:	3
+rx-frames:	32
+rx-usecs-irq:	n/a
+rx-frames-irq:	n/a
+
+tx-usecs:	16
+tx-frames:	32
+tx-usecs-irq:	n/a
+tx-frames-irq:	n/a
+
+rx-usecs-low:	n/a
+rx-frame-low:	n/a
+tx-usecs-low:	n/a
+tx-frame-low:	n/a
+
+rx-usecs-high:	n/a
+rx-frame-high:	n/a
+tx-usecs-high:	n/a
+tx-frame-high:	n/a
+
+CQE mode RX: on  TX: off
+
+tx-aggr-max-bytes:	n/a
+tx-aggr-max-frames:	n/a
+tx-aggr-time-usecs:	n/a
+
+
+### pause
+Pause parameters for eth0:
+Autonegotiate:	off
+RX:		on
+TX:		on
+
+
+### timestamping
+Time stamping parameters for eth0:
+Capabilities:
+	hardware-transmit
+	software-transmit
+	hardware-receive
+	software-receive
+	software-system-clock
+	hardware-raw-clock
+Hardware timestamp provider index: <n>
+Hardware timestamp provider qualifier: Precise (IEEE 1588 quality)
+Hardware timestamp source: MAC
+Hardware Transmit Timestamp Modes:
+	off
+	on
+Hardware Receive Filter Modes:
+	none
+	all
+
+### rss
+RSS hash function:
+    toeplitz: on
+    xor: off
+    crc32: off
+RSS input transformation:
+    symmetric-xor: off
+    symmetric-or-xor: on
+RSS hash key: present
+
+### fec
+FEC parameters for eth0:
+Supported/Configured FEC encodings: Auto
+Active FEC encoding: RS
+
+### module
+	Identifier                                : 0x11 (QSFP28)
+	Extended identifier                       : 0x00
+	Extended identifier description           : 1.5W max. Power consumption
+	Extended identifier description           : No CDR in TX, No CDR in RX
+	Extended identifier description           :  High Power Class (> 3.5 W) not enabled
+	Power set                                 : Off
+	Power override                            : Off
+	Connector                                 : 0x23 (No separable connector)
+	Transceiver codes                         : 0x80 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+	Transceiver type                          : 100G Ethernet: 100G Base-CR4 or 25G Base-CR CA-L
+	Encoding                                  : 0x00 (unspecified)
+	BR Nominal                                : 25500Mbps
+
+### statistics (names only)
+chN_aff_change
+chN_arm
+chN_eq_rearm
+chN_events
+chN_force_irq
+chN_poll
+ch_aff_change
+ch_arm
+ch_eq_rearm
+ch_events
+ch_force_irq
+ch_poll
+link_down_events_phy
+module_bad_shorted
+module_bus_stuck
+module_high_temp
+module_unplug
+rxN_arfs_add
+rxN_arfs_err
+rxN_arfs_expired
+rxN_arfs_request_in
+rxN_arfs_request_out
+rxN_buff_alloc_err
+rxN_bytes
+rxN_congst_umr
+rxN_cqe_compress_blks
+rxN_cqe_compress_pkts
+rxN_csum_complete
+rxN_csum_complete_tail
+rxN_csum_complete_tail_slow
+rxN_csum_none
+rxN_csum_unnecessary
+rxN_csum_unnecessary_inner
+rxN_ecn_mark
+rxN_gro_bytes
+rxN_gro_large_hds
+rxN_gro_packets
+rxN_gro_skbs
+rxN_hds_nodata_bytes
+rxN_hds_nodata_packets
+rxN_hds_nosplit_bytes
+rxN_hds_nosplit_packets
+rxN_lro_bytes
+rxN_lro_packets
+rxN_mpwqe_filler_cqes
+rxN_mpwqe_filler_strides
+rxN_oversize_pkts_sw_drop
+rxN_packets
+rxN_pp_alloc_empty
+rxN_pp_alloc_fast
+rxN_pp_alloc_refill
+rxN_pp_alloc_slow
+rxN_pp_alloc_slow_high_order
+rxN_pp_alloc_waive
+rxN_pp_recycle_cache_full
+rxN_pp_recycle_cached
+rxN_pp_recycle_released_ref
+rxN_pp_recycle_ring
+rxN_pp_recycle_ring_full
+rxN_recover
+rxN_removed_vlan_packets
+rxN_wqe_err
+rxN_xdp_drop
+rxN_xdp_redirect
+rxN_xdp_tx_cqes
+rxN_xdp_tx_err
+rxN_xdp_tx_full
+rxN_xdp_tx_inlnw
+rxN_xdp_tx_mpwqe
+rxN_xdp_tx_nops
+rxN_xdp_tx_xmit
+rx_1024_to_1518_bytes_phy
+rx_128_to_255_bytes_phy
+rx_1519_to_2047_bytes_phy
+rx_2048_to_4095_bytes_phy
+rx_256_to_511_bytes_phy
+rx_4096_to_8191_bytes_phy
+rx_512_to_1023_bytes_phy
+rx_64_bytes_phy
+rx_65_to_127_bytes_phy
+rx_8192_to_10239_bytes_phy
+rx_arfs_add
+rx_arfs_err
+rx_arfs_expired
+rx_arfs_request_in
+rx_arfs_request_out
+rx_broadcast_phy
+rx_buff_alloc_err
+rx_bytes
+rx_bytes_phy
+rx_congst_umr
+rx_cqe_compress_blks
+rx_cqe_compress_pkts
+rx_crc_errors_phy
+rx_csum_complete
+rx_csum_complete_tail
+rx_csum_complete_tail_slow
+rx_csum_none
+rx_csum_unnecessary
+rx_csum_unnecessary_inner
+rx_discards_phy
+rx_ecn_mark
+rx_fragments_phy
+rx_global_pause
+rx_global_pause_duration
+rx_global_pause_transition
+rx_gro_bytes
+rx_gro_large_hds
+rx_gro_packets
+rx_gro_skbs
+rx_hds_nodata_bytes
+rx_hds_nodata_packets
+rx_hds_nosplit_bytes
+rx_hds_nosplit_packets
+rx_if_down_packets
+rx_in_range_len_errors_phy
+rx_jabbers_phy
+rx_lro_bytes
+rx_lro_packets
+rx_mac_control_phy
+rx_mpwqe_filler_cqes
+rx_mpwqe_filler_strides
+rx_multicast_phy
+rx_out_of_buffer
+rx_out_of_range_len_phy
+rx_oversize_pkts_phy
+rx_oversize_pkts_sw_drop
+rx_packets
+rx_packets_phy
+rx_pause_ctrl_phy
+rx_pp_alloc_empty
+rx_pp_alloc_fast
+rx_pp_alloc_refill
+rx_pp_alloc_slow
+rx_pp_alloc_slow_high_order
+rx_pp_alloc_waive
+rx_pp_recycle_cache_full
+rx_pp_recycle_cached
+rx_pp_recycle_released_ref
+rx_pp_recycle_ring
+rx_pp_recycle_ring_full
+rx_prio0_bytes
+rx_prio0_discards
+rx_prio0_packets
+rx_prio1_bytes
+rx_prio1_discards
+rx_prio1_packets
+rx_prio2_bytes
+rx_prio2_discards
+rx_prio2_packets
+rx_prio3_bytes
+rx_prio3_discards
+rx_prio3_packets
+rx_prio4_bytes
+rx_prio4_discards
+rx_prio4_packets
+rx_prio5_bytes
+rx_prio5_discards
+rx_prio5_packets
+rx_prio6_bytes
+rx_prio6_discards
+rx_prio6_packets
+rx_prio7_bytes
+rx_prio7_discards
+rx_prio7_packets
+rx_recover
+rx_removed_vlan_packets
+rx_symbol_err_phy
+rx_undersize_pkts_phy
+rx_unsupported_op_phy
+rx_vport_broadcast_bytes
+rx_vport_broadcast_packets
+rx_vport_multicast_bytes
+rx_vport_multicast_packets
+rx_vport_rdma_multicast_bytes
+rx_vport_rdma_multicast_packets
+rx_vport_rdma_unicast_bytes
+rx_vport_rdma_unicast_packets
+rx_vport_unicast_bytes
+rx_vport_unicast_packets
+rx_wqe_err
+rx_xdp_drop
+rx_xdp_redirect
+rx_xdp_tx_cqe
+rx_xdp_tx_err
+rx_xdp_tx_full
+rx_xdp_tx_inlnw
+rx_xdp_tx_mpwqe
+rx_xdp_tx_nops
+rx_xdp_tx_xmit
+rx_xsk_buff_alloc_err
+rx_xsk_bytes
+rx_xsk_congst_umr
+rx_xsk_cqe_compress_blks
+rx_xsk_cqe_compress_pkts
+rx_xsk_csum_complete
+rx_xsk_csum_none
+rx_xsk_csum_unnecessary
+rx_xsk_csum_unnecessary_inner
+rx_xsk_ecn_mark
+rx_xsk_mpwqe_filler_cqes
+rx_xsk_mpwqe_filler_strides
+rx_xsk_oversize_pkts_sw_drop
+rx_xsk_packets
+rx_xsk_removed_vlan_packets
+rx_xsk_wqe_err
+rx_xsk_xdp_drop
+rx_xsk_xdp_redirect
+txN_added_vlan_packets
+txN_bytes
+txN_cqe_err
+txN_cqes
+txN_csum_none
+txN_csum_partial
+txN_csum_partial_inner
+txN_dropped
+txN_mpwqe_blks
+txN_mpwqe_pkts
+txN_nop
+txN_packets
+txN_recover
+txN_stopped
+txN_timestamps
+txN_tso_bytes
+txN_tso_inner_bytes
+txN_tso_inner_packets
+txN_tso_packets
+txN_wake
+txN_xdp_cqes
+txN_xdp_err
+txN_xdp_full
+txN_xdp_inlnw
+txN_xdp_mpwqe
+txN_xdp_nops
+txN_xdp_xmit
+txN_xmit_more
+tx_added_vlan_packets
+tx_broadcast_phy
+tx_bytes
+tx_bytes_phy
+tx_cqe_err
+tx_cqes
+tx_csum_none
+tx_csum_partial
+tx_csum_partial_inner
+tx_discards_phy
+tx_errors_phy
+tx_global_pause
+tx_global_pause_duration
+tx_mac_control_phy
+tx_mpwqe_blks
+tx_mpwqe_pkts
+tx_multicast_phy
+tx_nop
+tx_packets
+tx_packets_phy
+tx_pause_ctrl_phy
+tx_prio0_bytes
+tx_prio0_packets
+tx_prio1_bytes
+tx_prio1_packets
+tx_prio2_bytes
+tx_prio2_packets
+tx_prio3_bytes
+tx_prio3_packets
+tx_prio4_bytes
+tx_prio4_packets
+tx_prio5_bytes
+tx_prio5_packets
+tx_prio6_bytes
+tx_prio6_packets
+tx_prio7_bytes
+tx_prio7_packets
+tx_queue_dropped
+tx_queue_stopped
+tx_queue_wake
+tx_recover
+tx_tso_bytes
+tx_tso_inner_bytes
+tx_tso_inner_packets
+tx_tso_packets
+tx_vport_broadcast_bytes
+tx_vport_broadcast_packets
+tx_vport_multicast_bytes
+tx_vport_multicast_packets
+tx_vport_rdma_multicast_bytes
+tx_vport_rdma_multicast_packets
+tx_vport_rdma_unicast_bytes
+tx_vport_rdma_unicast_packets
+tx_vport_unicast_bytes
+tx_vport_unicast_packets
+tx_xdp_cqes
+tx_xdp_err
+tx_xdp_full
+tx_xdp_inlnw
+tx_xdp_mpwqe
+tx_xdp_nops
+tx_xdp_xmit
+tx_xmit_more
+tx_xsk_cqes
+tx_xsk_err
+tx_xsk_full
+tx_xsk_inlnw
+tx_xsk_mpwqe
+tx_xsk_xmit
+
+### devlink
+pci/<pci>:
+  driver mlx5_core
+  versions:
+      fixed:
+        fw.psid QEMU0000000001
+      running:
+        fw.version 16.35.4030
+        fw 16.35.4030
+      stored:
+        fw.version 16.35.4030
+        fw 16.35.4030
+pci/<pci>:
+  name enable_sriov type generic
+    values:
+      cmode permanent value false
+  name enable_roce type generic
+    values:
+      cmode driverinit value false
+  name enable_eth type generic
+    values:
+      cmode driverinit value true
+  name enable_rdma type generic
+    values:
+      cmode driverinit value true
+  name io_eq_size type generic
+    values:
+      cmode driverinit value 1024
+  name event_eq_size type generic
+    values:
+      cmode driverinit value 4096
+  name total_vfs type generic
+    values:
+      cmode permanent value 0
+  name num_doorbells type generic
+    values:
+      cmode driverinit value 8
+  name flow_steering_mode type driver-specific
+    values:
+      cmode runtime value dmfs
+  name fdb_large_groups type driver-specific
+    values:
+      cmode driverinit value 15
+  name hairpin_num_queues type driver-specific
+    values:
+      cmode driverinit value 2
+  name hairpin_queue_size type driver-specific
+    values:
+      cmode driverinit value 1
+  name cqe_compress_type type driver-specific
+    values:
+      cmode permanent value balanced
+pci/<pci>:
+  reporter fw
+    state healthy error <n> recover <n> auto_dump true
+  reporter fw_fatal
+    state healthy error <n> recover <n> grace_period 60000 auto_recover true auto_dump true
+  reporter vnic
+    state healthy error <n> recover <n>
+
+### ptp clock
+mlx5_ptp
+50000000
+0
+0
+0
+0
+cat: can't open '/sys/class/ptp/ptp0/pps': No such file or directory
+
+### hwmon
+name
+temp1_crit
+temp1_highest
+temp1_input
+temp1_label
+temp1_reset_history
+
+### kernel log
+mlx5_core <pci>: enabling device (0000 -> 0002)
+mlx5_core <pci>: firmware version: 16.35.4030
+mlx5_core <pci>: 126.016 Gb/s available PCIe bandwidth (8.0 GT/s PCIe x16 link)
+mlx5_core <pci>: Flow counters bulk query buffer size increased, bulk_query_len(1)
+mlx5_core <pci>: MLX5E: StrdRq(1) RqSz(8) StrdSz(2048) RxCqeCmprss(0 basic)
+mlx5_core <pci> eth0: Link down
+mlx5_core <pci> eth0: Link up

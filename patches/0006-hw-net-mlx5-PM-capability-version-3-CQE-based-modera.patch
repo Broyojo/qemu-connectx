@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Broyojo <dha@xoba.com>
+Date: Tue, 6 Oct 2026 16:59:32 -0400
+Subject: [PATCH 6/6] hw/net/mlx5: PM capability version 3, CQE-based
+ moderation capability
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DntkPG3Xz6WwgDaRoET5gX
+---
+ hw/net/mlx5/mlx5.c     | 3 +++
+ hw/net/mlx5/mlx5_cmd.c | 1 +
+ 2 files changed, 4 insertions(+)
+
+diff --git a/hw/net/mlx5/mlx5.c b/hw/net/mlx5/mlx5.c
+index 0b9d057..0ea68a2 100644
+--- a/hw/net/mlx5/mlx5.c
++++ b/hw/net/mlx5/mlx5.c
+@@ -332,6 +332,9 @@ static void mlx5_realize(PCIDevice *pci_dev, Error **errp)
+     if (pci_pm_init(pci_dev, MLX5_PCI_PM_OFFSET, errp) < 0) {
+         return;
+     }
++    /* Power management interface version 3 (PCI PM 1.2), no PME. */
++    pci_set_word(pci_dev->config + MLX5_PCI_PM_OFFSET + PCI_PM_PMC,
++                 PCI_PM_CAP_VER_1_2);
+     if (pcie_endpoint_cap_init(pci_dev, MLX5_PCI_EXP_OFFSET) < 0) {
+         error_setg(errp, "failed to initialize PCIe capability");
+         return;
+diff --git a/hw/net/mlx5/mlx5_cmd.c b/hw/net/mlx5/mlx5_cmd.c
+index 4e7a78c..abad1ff 100644
+--- a/hw/net/mlx5/mlx5_cmd.c
++++ b/hw/net/mlx5/mlx5_cmd.c
+@@ -238,6 +238,7 @@ static void mlx5_fill_general_caps(MLX5State *s, uint8_t *cap)
+     MLX5_SET(cmd_hca_cap, cap, cq_oi, 1);
+     /* Moderation settings are accepted; completions are never delayed. */
+     MLX5_SET(cmd_hca_cap, cap, cq_moderation, 1);
++    MLX5_SET(cmd_hca_cap, cap, cq_period_start_from_cqe, 1);
+     MLX5_SET(cmd_hca_cap, cap, uar_sz, ctz32(MLX5_BAR0_SIZE / MiB));
+     MLX5_SET(cmd_hca_cap, cap, log_pg_sz, 12);
+     MLX5_SET(cmd_hca_cap, cap, log_bf_reg_size, 9);

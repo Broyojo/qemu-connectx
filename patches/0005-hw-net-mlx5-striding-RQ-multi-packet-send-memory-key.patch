@@ -1,0 +1,1789 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Broyojo <dha@xoba.com>
+Date: Tue, 6 Oct 2026 16:49:18 -0400
+Subject: [PATCH 5/6] hw/net/mlx5: striding RQ, multi-packet send, memory keys,
+ inventory registers
+
+Bring the data path and the port's self-description in line with what a
+ConnectX-5 offers by default:
+
+ - Memory keys with MTT, KSM and KLM translation tables, created with
+   CREATE_MKEY and updated by UMR work queue entries.  Every address in a
+   work queue entry is now resolved through its key.
+ - Striding (multi-packet) receive queues, which the driver prefers over
+   the scatter-list ones, including filler completions.
+ - Enhanced multi-packet send WQEs.
+ - CQE compression may be enabled; the device never chooses to compress.
+ - Long transmit bursts are continued from a bottom half so that one busy
+   queue does not hold up the rest of the machine.
+ - Port registers: the full set of ConnectX-5 link modes with speed
+   selection and autonegotiation state, FEC (PPLM), the cable's module
+   EEPROM (MCIA, a QSFP28 passive copper cable), and the PCAM/MCAM
+   capability masks.  Management registers: firmware component version
+   (MCQS/MCQI) and a temperature sensor (MTCAP/MTMP).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DntkPG3Xz6WwgDaRoET5gX
+---
+ hw/net/meson.build      |   2 +
+ hw/net/mlx5/mlx5.c      |  10 +
+ hw/net/mlx5/mlx5.h      |  49 +++-
+ hw/net/mlx5/mlx5_cmd.c  | 216 ++++-------------
+ hw/net/mlx5/mlx5_dp.c   | 235 +++++++++++++++---
+ hw/net/mlx5/mlx5_hw.h   |  71 +++++-
+ hw/net/mlx5/mlx5_mkey.c | 272 +++++++++++++++++++++
+ hw/net/mlx5/mlx5_reg.c  | 521 ++++++++++++++++++++++++++++++++++++++++
+ hw/net/trace-events     |   4 +
+ 9 files changed, 1176 insertions(+), 204 deletions(-)
+ create mode 100644 hw/net/mlx5/mlx5_mkey.c
+ create mode 100644 hw/net/mlx5/mlx5_reg.c
+
+diff --git a/hw/net/meson.build b/hw/net/meson.build
+index 66116c1..455eff5 100644
+--- a/hw/net/meson.build
++++ b/hw/net/meson.build
+@@ -64,6 +64,8 @@ system_ss.add(when: 'CONFIG_MLX5', if_true: files(
+   'mlx5/mlx5_cmd.c',
+   'mlx5/mlx5_dp.c',
+   'mlx5/mlx5_fs.c',
++  'mlx5/mlx5_mkey.c',
++  'mlx5/mlx5_reg.c',
+ ))
+ 
+ system_ss.add(when: 'CONFIG_ROCKER', if_true: files(
+diff --git a/hw/net/mlx5/mlx5.c b/hw/net/mlx5/mlx5.c
+index 3712b1c..0b9d057 100644
+--- a/hw/net/mlx5/mlx5.c
++++ b/hw/net/mlx5/mlx5.c
+@@ -25,6 +25,7 @@
+ #include "qemu/log.h"
+ #include "qemu/module.h"
+ #include "qemu/timer.h"
++#include "qemu/main-loop.h"
+ #include "qapi/error.h"
+ #include "hw/pci/msix.h"
+ #include "hw/pci/pcie.h"
+@@ -100,10 +101,16 @@ static void mlx5_tx_retry_timer(void *opaque)
+     mlx5_tx_resume(opaque);
+ }
+ 
++static void mlx5_tx_bh(void *opaque)
++{
++    mlx5_tx_resume(opaque);
++}
++
+ static void mlx5_reset(MLX5State *s)
+ {
+     mlx5_cmd_reset(s);
+     timer_del(s->tx_retry_timer);
++    qemu_bh_cancel(s->tx_bh);
+     s->tx_paused = false;
+     /* Frames held back for a stalled receive queue are dropped now. */
+     timer_del(s->rx_retry_timer);
+@@ -365,6 +372,8 @@ static void mlx5_realize(PCIDevice *pci_dev, Error **errp)
+                                      s);
+     s->tx_retry_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mlx5_tx_retry_timer,
+                                      s);
++    s->tx_bh = qemu_bh_new_guarded(mlx5_tx_bh, s,
++                                   &DEVICE(s)->mem_reentrancy_guard);
+     s->tx_buf = g_malloc(MLX5_MAX_TX_PKT);
+     s->seg_buf = g_malloc(MLX5_MAX_LSO_HEADER + UINT16_MAX);
+     s->rx_buf = g_malloc(MLX5_MAX_FRAME);
+@@ -377,6 +386,7 @@ static void mlx5_exit(PCIDevice *pci_dev)
+ 
+     timer_free(s->rx_retry_timer);
+     timer_free(s->tx_retry_timer);
++    qemu_bh_delete(s->tx_bh);
+     mlx5_cmd_cleanup(s);
+     g_free(s->tx_buf);
+     g_free(s->seg_buf);
+diff --git a/hw/net/mlx5/mlx5.h b/hw/net/mlx5/mlx5.h
+index 9600972..9f351d1 100644
+--- a/hw/net/mlx5/mlx5.h
++++ b/hw/net/mlx5/mlx5.h
+@@ -36,6 +36,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(MLX5State, MLX5)
+  * link partner cannot take frames stops sending and checks again later.
+  */
+ #define MLX5_RX_STALL_NS            (500 * SCALE_MS)
++/*
++ * Frames sent per doorbell before the rest is left to a bottom half, so
++ * that one busy queue does not keep the rest of the machine waiting.
++ */
++#define MLX5_TX_BURST               256
+ #define MLX5_RX_RETRY_NS            (100 * SCALE_US)
+ /* Port MTU as the driver counts it: including the Ethernet header and FCS. */
+ #define MLX5_MAX_MTU                10240
+@@ -76,6 +81,10 @@ typedef struct MLX5Wq {
+     uint8_t type;
+     uint8_t log_stride;
+     uint8_t log_size;
++    /* striding receive queues only */
++    uint8_t log_num_strides;
++    uint8_t log_stride_size;
++    bool two_byte_shift;
+     uint64_t dbr_addr;
+     MLX5Buf buf;
+ } MLX5Wq;
+@@ -93,11 +102,29 @@ typedef struct MLX5Rq {
+     uint32_t cqn;
+     uint8_t state;
+     bool vlan_strip;
++    bool used;              /* has ever received a frame */
+     uint16_t cc;            /* number of receive WQEs consumed */
+-    uint16_t ll_head;       /* next WQE on a linked-list work queue */
++    /* linked-list work queues: the WQE consumed last, -1 before the first */
++    int32_t ll_prev;
++    /* striding: the WQE being filled and its first free stride */
++    bool cur_valid;
++    uint16_t cur_idx;
++    uint32_t cur_stride;
+     MLX5Wq wq;
+ } MLX5Rq;
+ 
++/* Memory key: how to turn an address in a WQE into guest memory. */
++typedef struct MLX5Mkey {
++    uint32_t index;
++    uint8_t access_mode;    /* MLX5_MKC_ACCESS_MODE_* */
++    bool free;              /* not usable until a UMR WQE enables it */
++    uint64_t start_addr;
++    uint64_t len;
++    uint8_t log_page_size;
++    uint8_t *xlt;           /* translation entries, as the driver wrote them */
++    uint64_t xlt_size;
++} MLX5Mkey;
++
+ typedef struct MLX5Rqt {
+     uint32_t rqtn;
+     uint32_t size;
+@@ -187,6 +214,9 @@ struct MLX5State {
+     uint16_t vport_mtu;
+     bool port_admin_up;
+     uint8_t tx_mac[ETH_ALEN];   /* source address of the last sent frame */
++    uint32_t ptys_admin;    /* link modes the driver allows; 0 for all */
++    bool an_disable;
++    uint8_t pplm[MLX5_ST_SZ_BYTES(pplm_reg)];   /* FEC settings */
+     bool pause_rx;          /* honour pause frames from the link partner */
+     bool pause_tx;          /* pause the link partner when out of buffers */
+ 
+@@ -196,6 +226,7 @@ struct MLX5State {
+     int64_t rx_stalled_since;
+     QEMUTimer *tx_retry_timer;
+     bool tx_paused;
++    QEMUBH *tx_bh;          /* continues long transmit bursts */
+ 
+     /* timer value when the WQE being processed put its first frame out */
+     uint64_t tx_ts;
+@@ -207,6 +238,7 @@ struct MLX5State {
+     GHashTable *sqs;
+     GHashTable *rqs;
+     GHashTable *rqts;
++    GHashTable *mkeys;
+     GHashTable *tirs;
+     GHashTable *flow_tables;
+     uint32_t rx_root_ft;    /* where receive classification starts */
+@@ -252,6 +284,21 @@ void mlx5_cmd_init(MLX5State *s);
+ void mlx5_cmd_cleanup(MLX5State *s);
+ uint32_t mlx5_alloc_id(MLX5State *s);
+ 
++/* mlx5_reg.c */
++int mlx5_access_reg(MLX5State *s, uint16_t reg_id, bool write, uint8_t *data,
++                    uint32_t len);
++void mlx5_reg_reset(MLX5State *s);
++
++/* mlx5_mkey.c */
++MLX5_CMD_HANDLER(mlx5_cmd_create_mkey);
++MLX5_CMD_HANDLER(mlx5_cmd_destroy_mkey);
++MemTxResult mlx5_mkey_rw(MLX5State *s, uint32_t key, uint64_t va, void *buf,
++                         uint64_t len, bool is_write);
++void mlx5_mkey_umr(MLX5State *s, const uint8_t *wqe, size_t wqe_len);
++void mlx5_mkey_reset(MLX5State *s);
++void mlx5_mkey_init(MLX5State *s);
++void mlx5_mkey_cleanup(MLX5State *s);
++
+ /* mlx5_fs.c */
+ MLX5_CMD_HANDLER(mlx5_cmd_create_flow_table);
+ MLX5_CMD_HANDLER(mlx5_cmd_modify_flow_table);
+diff --git a/hw/net/mlx5/mlx5_cmd.c b/hw/net/mlx5/mlx5_cmd.c
+index ec9b161..4e7a78c 100644
+--- a/hw/net/mlx5/mlx5_cmd.c
++++ b/hw/net/mlx5/mlx5_cmd.c
+@@ -229,6 +229,9 @@ static void mlx5_fill_general_caps(MLX5State *s, uint8_t *cap)
+     MLX5_SET(cmd_hca_cap, cap, log_max_mkey, 20);
+     MLX5_SET(cmd_hca_cap, cap, log_max_eq, ctz32(MLX5_MAX_EQS));
+     MLX5_SET(cmd_hca_cap, cap, nic_flow_table, 1);
++    /* The PCAM and MCAM registers say which other registers exist. */
++    MLX5_SET(cmd_hca_cap, cap, pcam_reg, 1);
++    MLX5_SET(cmd_hca_cap, cap, mcam_reg, 1);
+     MLX5_SET(cmd_hca_cap, cap, port_type, MLX5_CAP_PORT_TYPE_ETH);
+     MLX5_SET(cmd_hca_cap, cap, num_ports, 1);
+     MLX5_SET(cmd_hca_cap, cap, eth_net_offloads, 1);
+@@ -248,6 +251,23 @@ static void mlx5_fill_general_caps(MLX5State *s, uint8_t *cap)
+     MLX5_SET(cmd_hca_cap, cap, log_max_tir, 10);
+     MLX5_SET(cmd_hca_cap, cap, log_max_tis, 10);
+     MLX5_SET(cmd_hca_cap, cap, basic_cyclic_rcv_wqe, 1);
++    /* Striding receive queues, fed through memory keys updated by UMR. */
++    MLX5_SET(cmd_hca_cap, cap, striding_rq, 1);
++    MLX5_SET(cmd_hca_cap, cap, ext_stride_num_range, 1);
++    MLX5_SET(cmd_hca_cap, cap, log_max_stride_sz_rq, 13);
++    MLX5_SET(cmd_hca_cap, cap, log_min_stride_sz_rq, 6);
++    MLX5_SET(cmd_hca_cap, cap, umr_ptr_rlky, 1);
++    MLX5_SET(cmd_hca_cap, cap, umr_extended_translation_offset, 1);
++    MLX5_SET(cmd_hca_cap, cap, fixed_buffer_size, 1);
++    MLX5_SET(cmd_hca_cap, cap, log_max_klm_list_size, 16);
++    MLX5_SET(cmd_hca_cap, cap, max_indirection, 4);
++    /*
++     * CQE compression may be requested; the device is free never to
++     * compress, and does not.
++     */
++    MLX5_SET(cmd_hca_cap, cap, cqe_compression, 1);
++    MLX5_SET(cmd_hca_cap, cap, cqe_compression_timeout, 2);
++    MLX5_SET(cmd_hca_cap, cap, cqe_compression_max_num, 64);
+     MLX5_SET(cmd_hca_cap, cap, log_max_rqt, 10);
+     MLX5_SET(cmd_hca_cap, cap, log_max_rqt_size, 8);
+     MLX5_SET(cmd_hca_cap, cap, log_max_tis_per_sq, 3);
+@@ -275,6 +295,9 @@ static void mlx5_fill_eth_caps(MLX5State *s, uint8_t *cap)
+     MLX5_SET(per_protocol_networking_offload_caps, cap, wqe_inline_mode,
+              MLX5_CAP_INLINE_MODE_NOT_REQUIRED);
+     MLX5_SET(per_protocol_networking_offload_caps, cap, rss_ind_tbl_cap, 8);
++    MLX5_SET(per_protocol_networking_offload_caps, cap, reg_umr_sq, 1);
++    MLX5_SET(per_protocol_networking_offload_caps, cap,
++             enhanced_multi_pkt_send_wqe, 1);
+ }
+ 
+ static void mlx5_fill_flow_table_caps(MLX5State *s, uint8_t *cap)
+@@ -400,18 +423,6 @@ static int cmd_dealloc_uar(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     return MLX5_CMD_STAT_OK;
+ }
+ 
+-static int cmd_create_mkey(MLX5State *s, const uint8_t *in, uint32_t inlen,
+-                           uint8_t *out, uint32_t outlen)
+-{
+-    MLX5_CMD_CHECK_LEN(create_mkey_in, create_mkey_out);
+-    /*
+-     * Only physical-address keys are meaningful to the model: every data
+-     * segment address is taken as a bus address.
+-     */
+-    MLX5_SET(create_mkey_out, out, mkey_index, mlx5_alloc_id(s));
+-    return MLX5_CMD_STAT_OK;
+-}
+-
+ static int cmd_create_eq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                          uint8_t *out, uint32_t outlen)
+ {
+@@ -520,6 +531,16 @@ static int mlx5_wq_init(MLX5Wq *wq, const uint8_t *wqc, const uint8_t *end)
+     if (wq->log_stride < 4 || wq->log_stride > 10 || wq->log_size > 16) {
+         return MLX5_CMD_STAT_BAD_PARAM_ERR;
+     }
++    if (wq->type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ) {
++        /* A 4-bit two's complement offset: the count may go below the base. */
++        int num = MLX5_GET(wq, wqc, log_wqe_num_of_strides);
++
++        wq->log_num_strides = MLX5_MPWQE_LOG_NUM_STRIDES_BASE +
++                              (num & 8 ? num - 16 : num);
++        wq->log_stride_size = MLX5_MPWQE_LOG_STRIDE_SZ_BASE +
++                              MLX5_GET(wq, wqc, log_wqe_stride_size);
++        wq->two_byte_shift = MLX5_GET(wq, wqc, two_byte_shift_en);
++    }
+     return mlx5_buf_init(&wq->buf, MLX5_ADDR_OF(wq, wqc, pas), end,
+                          1ull << (wq->log_size + wq->log_stride),
+                          MLX5_GET(wq, wqc, log_wq_pg_sz));
+@@ -633,11 +654,12 @@ static int cmd_create_rq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     rq->vlan_strip = !MLX5_GET(rqc, rqc, vsd);
+     ret = mlx5_wq_init(&rq->wq, MLX5_ADDR_OF(rqc, rqc, wq), in + inlen);
+     if (!ret && rq->wq.type != MLX5_WQ_TYPE_CYCLIC &&
+-        rq->wq.type != MLX5_WQ_TYPE_LINKED_LIST) {
+-        /* Striding (multi-packet) receive queues are not advertised. */
++        rq->wq.type != MLX5_WQ_TYPE_LINKED_LIST &&
++        rq->wq.type != MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ) {
+         mlx5_buf_free(&rq->wq.buf);
+         ret = MLX5_CMD_STAT_BAD_PARAM_ERR;
+     }
++    rq->ll_prev = -1;
+     if (ret) {
+         g_free(rq);
+         return ret;
+@@ -672,7 +694,8 @@ static int cmd_modify_rq(MLX5State *s, const uint8_t *in, uint32_t inlen,
+     state = MLX5_GET(rqc, rqc, state);
+     if (state == MLX5_RQC_STATE_RST) {
+         rq->cc = 0;
+-        rq->ll_head = 0;
++        rq->ll_prev = -1;
++        rq->cur_valid = false;
+     }
+     rq->state = state;
+     trace_mlx5_modify_rq(rq->rqn, state, rq->vlan_strip);
+@@ -876,158 +899,6 @@ static int cmd_query_q_counter(MLX5State *s, const uint8_t *in,
+     return MLX5_CMD_STAT_OK;
+ }
+ 
+-/* PTYS speed bit (legacy 32-bit protocol mask) for a link speed in Mb/s. */
+-static uint32_t mlx5_speed_to_proto(uint32_t speed)
+-{
+-    switch (speed) {
+-    case 1000:
+-        return 1u << 1;     /* 1000BASE-KX */
+-    case 10000:
+-        return 1u << 4;     /* 10GBASE-KR */
+-    case 25000:
+-        return 1u << 28;    /* 25GBASE-KR */
+-    case 40000:
+-        return 1u << 7;     /* 40GBASE-KR4 */
+-    case 50000:
+-        return 1u << 31;    /* 50GBASE-KR2 */
+-    case 100000:
+-    default:
+-        return 1u << 22;    /* 100GBASE-KR4 */
+-    }
+-}
+-
+-#define PPCNT_SET(data, fld, val)                                           \
+-    do {                                                                    \
+-        MLX5_SET(ppcnt_reg, data,                                           \
+-                 counter_set.eth_802_3_cntrs_grp_data_layout.fld ## _high,  \
+-                 (val) >> 32);                                              \
+-        MLX5_SET(ppcnt_reg, data,                                           \
+-                 counter_set.eth_802_3_cntrs_grp_data_layout.fld ## _low,   \
+-                 (val));                                                    \
+-    } while (0)
+-
+-/* Port counters.  Only the IEEE 802.3 group has anything to report. */
+-static void mlx5_reg_ppcnt(MLX5State *s, uint8_t *data)
+-{
+-    MLX5Stats *st = &s->stats;
+-
+-    if (MLX5_GET(ppcnt_reg, data, grp) != MLX5_IEEE_802_3_COUNTERS_GROUP) {
+-        return;
+-    }
+-    PPCNT_SET(data, a_frames_transmitted_ok, st->tx_packets);
+-    PPCNT_SET(data, a_frames_received_ok, st->rx_phy_packets);
+-    PPCNT_SET(data, a_octets_transmitted_ok, st->tx_bytes);
+-    PPCNT_SET(data, a_octets_received_ok, st->rx_phy_bytes);
+-    PPCNT_SET(data, a_multicast_frames_xmitted_ok, st->tx_mcast_packets);
+-    PPCNT_SET(data, a_broadcast_frames_xmitted_ok, st->tx_bcast_packets);
+-    PPCNT_SET(data, a_multicast_frames_received_ok, st->rx_mcast_packets);
+-    PPCNT_SET(data, a_broadcast_frames_received_ok, st->rx_bcast_packets);
+-}
+-
+-/*
+- * ACCESS_REG reads and writes port and management registers.  @data holds the
+- * register on input and, for reads, receives the device's values.
+- */
+-static int mlx5_access_reg(MLX5State *s, uint16_t reg_id, bool write,
+-                           uint8_t *data, uint32_t len)
+-{
+-    bool was_up = mlx5_link_up(s);
+-    uint32_t proto;
+-
+-    switch (reg_id) {
+-    case MLX5_REG_HOST_ENDIANNESS:
+-        return MLX5_CMD_STAT_OK;
+-
+-    case MLX5_REG_PMTU:
+-        if (len < MLX5_ST_SZ_BYTES(pmtu_reg)) {
+-            return MLX5_CMD_STAT_BAD_INP_LEN_ERR;
+-        }
+-        if (write) {
+-            s->admin_mtu = MLX5_GET(pmtu_reg, data, admin_mtu);
+-        } else {
+-            MLX5_SET(pmtu_reg, data, max_mtu, MLX5_MAX_MTU);
+-            MLX5_SET(pmtu_reg, data, admin_mtu, s->admin_mtu);
+-            MLX5_SET(pmtu_reg, data, oper_mtu, s->admin_mtu);
+-        }
+-        return MLX5_CMD_STAT_OK;
+-
+-    case MLX5_REG_PAOS:
+-        if (len < MLX5_ST_SZ_BYTES(paos_reg)) {
+-            return MLX5_CMD_STAT_BAD_INP_LEN_ERR;
+-        }
+-        if (write) {
+-            /* "ase" marks the admin state as being updated. */
+-            if (MLX5_GET(paos_reg, data, ase)) {
+-                s->port_admin_up =
+-                    MLX5_GET(paos_reg, data, admin_status) == MLX5_PORT_UP;
+-                if (mlx5_link_up(s) != was_up) {
+-                    mlx5_port_event(s);
+-                }
+-            }
+-        } else {
+-            MLX5_SET(paos_reg, data, admin_status,
+-                     s->port_admin_up ? MLX5_PORT_UP : MLX5_PORT_DOWN);
+-            MLX5_SET(paos_reg, data, oper_status,
+-                     was_up ? MLX5_PORT_UP : MLX5_PORT_DOWN);
+-        }
+-        return MLX5_CMD_STAT_OK;
+-
+-    case MLX5_REG_PTYS:
+-        if (len < MLX5_ST_SZ_BYTES(ptys_reg)) {
+-            return MLX5_CMD_STAT_BAD_INP_LEN_ERR;
+-        }
+-        if (!write) {
+-            proto = mlx5_speed_to_proto(s->link_speed);
+-            MLX5_SET(ptys_reg, data, eth_proto_capability, proto);
+-            MLX5_SET(ptys_reg, data, eth_proto_admin, proto);
+-            MLX5_SET(ptys_reg, data, eth_proto_oper, was_up ? proto : 0);
+-        }
+-        return MLX5_CMD_STAT_OK;
+-
+-    case MLX5_REG_PPCNT:
+-        if (len < MLX5_ST_SZ_BYTES(ppcnt_reg)) {
+-            return MLX5_CMD_STAT_BAD_INP_LEN_ERR;
+-        }
+-        if (!write) {
+-            mlx5_reg_ppcnt(s, data);
+-        }
+-        return MLX5_CMD_STAT_OK;
+-
+-    case MLX5_REG_PFCC:
+-        /* Global pause (link-level flow control) settings. */
+-        if (len < MLX5_ST_SZ_BYTES(pfcc_reg)) {
+-            return MLX5_CMD_STAT_BAD_INP_LEN_ERR;
+-        }
+-        if (write) {
+-            /* A set "mask_n" bit leaves that direction as it is. */
+-            if (!MLX5_GET(pfcc_reg, data, pprx_mask_n)) {
+-                s->pause_rx = MLX5_GET(pfcc_reg, data, pprx);
+-            }
+-            if (!MLX5_GET(pfcc_reg, data, pptx_mask_n)) {
+-                s->pause_tx = MLX5_GET(pfcc_reg, data, pptx);
+-            }
+-        } else {
+-            MLX5_SET(pfcc_reg, data, pprx, s->pause_rx);
+-            MLX5_SET(pfcc_reg, data, aprx, s->pause_rx);
+-            MLX5_SET(pfcc_reg, data, pptx, s->pause_tx);
+-            MLX5_SET(pfcc_reg, data, aptx, s->pause_tx);
+-        }
+-        return MLX5_CMD_STAT_OK;
+-
+-    default:
+-        /*
+-         * Unmodelled registers read as zero, which the driver takes as
+-         * "nothing supported" for the optional features they describe.
+-         */
+-        qemu_log_mask(LOG_UNIMP, "mlx5: ACCESS_REG %s of register 0x%x\n",
+-                      write ? "write" : "read", reg_id);
+-        if (!write) {
+-            memset(data, 0, len);
+-        }
+-        return MLX5_CMD_STAT_OK;
+-    }
+-}
+-
+ static int cmd_access_reg(MLX5State *s, const uint8_t *in, uint32_t inlen,
+                           uint8_t *out, uint32_t outlen)
+ {
+@@ -1080,8 +951,8 @@ static const MLX5CmdInfo mlx5_cmds[] = {
+     CMD(ACCESS_REG, cmd_access_reg),
+ 
+     /* Memory keys, protection and transport domains, doorbell pages */
+-    CMD(CREATE_MKEY, cmd_create_mkey),
+-    CMD(DESTROY_MKEY, cmd_ok),
++    CMD(CREATE_MKEY, mlx5_cmd_create_mkey),
++    CMD(DESTROY_MKEY, mlx5_cmd_destroy_mkey),
+     CMD(QUERY_SPECIAL_CONTEXTS, cmd_query_special_contexts),
+     CMD(ALLOC_PD, cmd_alloc_id),
+     CMD(DEALLOC_PD, cmd_ok),
+@@ -1319,6 +1190,7 @@ void mlx5_cmd_doorbell(MLX5State *s, uint32_t vector)
+ void mlx5_cmd_reset(MLX5State *s)
+ {
+     mlx5_fs_reset(s);
++    mlx5_mkey_reset(s);
+     g_hash_table_remove_all(s->rqts);
+     g_hash_table_remove_all(s->rqs);
+     g_hash_table_remove_all(s->sqs);
+@@ -1331,9 +1203,7 @@ void mlx5_cmd_reset(MLX5State *s)
+     s->issi = 0;
+     s->next_id = 0;
+     s->port_admin_up = false;
+-    /* Flow control is on in both directions by default, as on hardware. */
+-    s->pause_rx = true;
+-    s->pause_tx = true;
++    mlx5_reg_reset(s);
+     s->admin_mtu = 1500 + ETH_HLEN + 8;
+     s->vport_mtu = s->admin_mtu;
+     memset(&s->stats, 0, sizeof(s->stats));
+@@ -1349,12 +1219,14 @@ void mlx5_cmd_init(MLX5State *s)
+     s->rqts = g_hash_table_new_full(NULL, NULL, NULL, mlx5_rqt_destroy);
+     s->uars = g_hash_table_new(NULL, NULL);
+     mlx5_fs_init(s);
++    mlx5_mkey_init(s);
+     mlx5_cmd_reset(s);
+ }
+ 
+ void mlx5_cmd_cleanup(MLX5State *s)
+ {
+     mlx5_fs_cleanup(s);
++    mlx5_mkey_cleanup(s);
+     g_hash_table_destroy(s->rqts);
+     g_hash_table_destroy(s->rqs);
+     g_hash_table_destroy(s->sqs);
+diff --git a/hw/net/mlx5/mlx5_dp.c b/hw/net/mlx5/mlx5_dp.c
+index 8683b55..3117697 100644
+--- a/hw/net/mlx5/mlx5_dp.c
++++ b/hw/net/mlx5/mlx5_dp.c
+@@ -21,6 +21,7 @@
+ #include "qemu/log.h"
+ #include "qemu/crc32c.h"
+ #include "qemu/timer.h"
++#include "qemu/main-loop.h"
+ #include "hw/pci/msix.h"
+ #include "net/eth.h"
+ #include "net/checksum.h"
+@@ -506,11 +507,10 @@ static void mlx5_sq_xmit(MLX5State *s, MLX5Sq *sq, const uint8_t *wqe,
+             memcpy(pkt + len, wqe + off + 4, count);
+             off += ROUND_UP(4 + count, MLX5_SEND_WQE_DS);
+         } else {
+-            uint64_t addr = ldq_be_p(wqe + off + 8);
+-
+             if (len + count > MLX5_MAX_TX_PKT ||
+-                pci_dma_read(PCI_DEVICE(s), addr, pkt + len,
+-                             count) != MEMTX_OK) {
++                mlx5_mkey_rw(s, ldl_be_p(wqe + off + 4),
++                             ldq_be_p(wqe + off + 8), pkt + len, count,
++                             false) != MEMTX_OK) {
+                 goto bad;
+             }
+             off += MLX5_SEND_WQE_DS;
+@@ -538,6 +538,50 @@ bad:
+                   sq->sqn);
+ }
+ 
++/*
++ * Enhanced multi-packet send WQE: after the control and Ethernet segments,
++ * every data segment is a frame of its own, by pointer or inline.
++ */
++static void mlx5_sq_xmit_mpw(MLX5State *s, MLX5Sq *sq, const uint8_t *wqe,
++                             size_t wqe_len)
++{
++    const struct mlx5_wqe_eth_seg *eseg =
++        (const void *)(wqe + sizeof(struct mlx5_wqe_ctrl_seg));
++    size_t off = sizeof(struct mlx5_wqe_ctrl_seg) + sizeof(*eseg);
++    uint8_t *pkt = s->tx_buf;
++
++    while (off + MLX5_SEND_WQE_DS <= wqe_len) {
++        uint32_t count = ldl_be_p(wqe + off);
++
++        if (count & MLX5_INLINE_SEG) {
++            count &= ~MLX5_INLINE_SEG;
++            if (off + 4 + count > wqe_len || count > MLX5_MAX_TX_PKT) {
++                goto bad;
++            }
++            memcpy(pkt, wqe + off + 4, count);
++            off += ROUND_UP(4 + count, MLX5_SEND_WQE_DS);
++        } else {
++            if (count > MLX5_MAX_TX_PKT ||
++                mlx5_mkey_rw(s, ldl_be_p(wqe + off + 4),
++                             ldq_be_p(wqe + off + 8), pkt, count,
++                             false) != MEMTX_OK) {
++                goto bad;
++            }
++            off += MLX5_SEND_WQE_DS;
++        }
++        if (count >= ETH_HLEN && mlx5_link_up(s)) {
++            mlx5_tx_csum(pkt, count, eseg->cs_flags & MLX5_ETH_WQE_L3_CSUM,
++                         eseg->cs_flags & MLX5_ETH_WQE_L4_CSUM);
++            mlx5_send(s, pkt, count);
++        }
++    }
++    return;
++
++bad:
++    qemu_log_mask(LOG_GUEST_ERROR, "mlx5: malformed multi-packet send WQE "
++                  "on SQ 0x%x\n", sq->sqn);
++}
++
+ /* Run the WQE at the SQ's consumer counter.  Returns false to stop. */
+ static bool mlx5_sq_process_wqe(MLX5State *s, MLX5Sq *sq)
+ {
+@@ -579,6 +623,12 @@ static bool mlx5_sq_process_wqe(MLX5State *s, MLX5Sq *sq)
+         mlx5_sq_xmit(s, sq, wqe, ds * MLX5_SEND_WQE_DS,
+                      opcode == MLX5_OPCODE_LSO);
+         break;
++    case MLX5_OPCODE_ENHANCED_MPSW:
++        mlx5_sq_xmit_mpw(s, sq, wqe, ds * MLX5_SEND_WQE_DS);
++        break;
++    case MLX5_OPCODE_UMR:
++        mlx5_mkey_umr(s, wqe, ds * MLX5_SEND_WQE_DS);
++        break;
+     default:
+         qemu_log_mask(LOG_UNIMP, "mlx5: send opcode 0x%x on SQ 0x%x\n",
+                       opcode, sq->sqn);
+@@ -614,6 +664,7 @@ err:
+ void mlx5_sq_doorbell(MLX5State *s, uint32_t sqn)
+ {
+     MLX5Sq *sq = g_hash_table_lookup(s->sqs, GUINT_TO_POINTER(sqn));
++    uint64_t sent = s->stats.tx_packets;
+     uint32_t budget;
+     uint16_t pc;
+ 
+@@ -622,6 +673,11 @@ void mlx5_sq_doorbell(MLX5State *s, uint32_t sqn)
+     }
+     pc = mlx5_dbr_read(s, sq->wq.dbr_addr, MLX5_SND_DBR);
+     for (budget = 1u << sq->wq.log_size; budget && sq->cc != pc; budget--) {
++        /* One WQE can stand for many frames (large or multi-packet send). */
++        if (s->stats.tx_packets - sent >= MLX5_TX_BURST) {
++            qemu_bh_schedule(s->tx_bh);
++            break;
++        }
+         if (s->pause_rx && !qemu_can_send_packet(qemu_get_queue(s->nic))) {
+             /* The link partner has paused us: pick up from here later. */
+             s->tx_paused = true;
+@@ -656,7 +712,8 @@ static bool mlx5_rq_has_buffers(MLX5State *s, MLX5Rq *rq)
+ {
+     uint16_t pc = mlx5_dbr_read(s, rq->wq.dbr_addr, MLX5_RCV_DBR);
+ 
+-    return rq->state == MLX5_RQC_STATE_RDY && pc != rq->cc;
++    /* A striding WQE that is partly used still has room. */
++    return rq->state == MLX5_RQC_STATE_RDY && (rq->cur_valid || pc != rq->cc);
+ }
+ 
+ /*
+@@ -706,19 +763,51 @@ static void mlx5_default_target(MLX5State *s, const uint8_t *buf,
+     *n = 0;
+ }
+ 
+-/* Copy a frame into the RQ's next receive WQE.  Returns false if it is lost. */
+-static bool mlx5_rq_fill(MLX5State *s, MLX5Rq *rq, const uint8_t *buf,
+-                         size_t size, uint16_t *wqe_counter)
++/* How a received frame is identified in its completion. */
++typedef struct MLX5RxDone {
++    uint16_t wqe_id;
++    uint16_t wqe_counter;
++    uint32_t byte_cnt;
++} MLX5RxDone;
++
++/*
++ * Index of the next WQE on a linked-list work queue.  The link is read from
++ * the WQE consumed last only now, when another one is known to be posted:
++ * the driver patches it as it recycles WQEs.
++ */
++static bool mlx5_rq_ll_next(MLX5State *s, MLX5Rq *rq, uint32_t *idx)
++{
++    uint16_t next = 0;
++
++    if (rq->ll_prev >= 0) {
++        if (mlx5_buf_rw(s, &rq->wq.buf,
++                        ((uint64_t)rq->ll_prev << rq->wq.log_stride) +
++                        offsetof(struct mlx5_wqe_srq_next_seg, next_wqe_index),
++                        &next, sizeof(next), false) != MEMTX_OK) {
++            return false;
++        }
++        next = be16_to_cpu(next);
++    }
++    *idx = next;
++    return next < (1u << rq->wq.log_size);
++}
++
++/*
++ * Copy a frame into the next WQE of a cyclic or linked-list receive queue,
++ * whose WQEs are scatter lists.  Returns false if the frame is lost.
++ */
++static bool mlx5_rq_fill_list(MLX5State *s, MLX5Rq *rq, const uint8_t *buf,
++                              size_t size, MLX5RxDone *done)
+ {
+     uint8_t wqe[1 << 10];
+     uint32_t stride = 1u << rq->wq.log_stride;
+     uint32_t nent = 1u << rq->wq.log_size;
+     bool linked = rq->wq.type == MLX5_WQ_TYPE_LINKED_LIST;
+-    uint32_t idx = linked ? rq->ll_head : rq->cc & (nent - 1);
++    uint32_t idx = rq->cc & (nent - 1);
+     size_t first = linked ? sizeof(struct mlx5_wqe_srq_next_seg) : 0;
+-    size_t off, room = 0, done = 0;
++    size_t off, room = 0, copied = 0;
+ 
+-    if (idx >= nent ||
++    if ((linked && !mlx5_rq_ll_next(s, rq, &idx)) ||
+         mlx5_buf_rw(s, &rq->wq.buf, (uint64_t)idx * stride, wqe, stride,
+                     false) != MEMTX_OK) {
+         return false;
+@@ -740,24 +829,107 @@ static bool mlx5_rq_fill(MLX5State *s, MLX5Rq *rq, const uint8_t *buf,
+         return false;
+     }
+ 
+-    for (off = first; done < size; off += MLX5_SEND_WQE_DS) {
++    for (off = first; copied < size; off += MLX5_SEND_WQE_DS) {
+         uint32_t count = ldl_be_p(wqe + off) & ~MLX5_INLINE_SEG;
+-        size_t n = MIN(count, size - done);
++        size_t n = MIN(count, size - copied);
+ 
+-        if (pci_dma_write(PCI_DEVICE(s), ldq_be_p(wqe + off + 8), buf + done,
+-                          n) != MEMTX_OK) {
++        if (mlx5_mkey_rw(s, ldl_be_p(wqe + off + 4), ldq_be_p(wqe + off + 8),
++                         (uint8_t *)buf + copied, n, true) != MEMTX_OK) {
+             return false;
+         }
+-        done += n;
++        copied += n;
+     }
+ 
+     /* Cyclic queues report the WQE counter, linked lists the WQE index. */
+-    *wqe_counter = linked ? idx : rq->cc;
+-    if (linked) {
+-        rq->ll_head = lduw_be_p(wqe + offsetof(struct mlx5_wqe_srq_next_seg,
+-                                               next_wqe_index));
+-    }
++    done->wqe_id = 0;
++    done->wqe_counter = linked ? idx : rq->cc;
++    done->byte_cnt = size;
++    rq->ll_prev = idx;
++    rq->cc++;
++    return true;
++}
++
++static void mlx5_rq_striding_next(MLX5Rq *rq)
++{
++    rq->ll_prev = rq->cur_idx;
++    rq->cur_valid = false;
+     rq->cc++;
++}
++
++/* Give back the unused strides at the end of the current WQE. */
++static void mlx5_rq_striding_filler(MLX5State *s, MLX5Rq *rq, MLX5Cq *cq,
++                                    uint32_t strides)
++{
++    struct mlx5_cqe64 cqe = {
++        .op_own = MLX5_CQE_RESP_SEND << 4,
++        .wqe_id = cpu_to_be16(rq->cur_idx),
++        .wqe_counter = cpu_to_be16(rq->cur_stride),
++        .byte_cnt = cpu_to_be32(MLX5_MPWRQ_CQE_FILLER |
++                                strides << MLX5_MPWRQ_CQE_STRIDES_SHIFT),
++    };
++
++    mlx5_cq_post(s, cq, &cqe);
++    mlx5_rq_striding_next(rq);
++}
++
++/*
++ * Striding receive queue: each WQE is one large buffer divided into strides,
++ * and a frame is written at the next free stride, taking as many as it
++ * needs.  When a frame does not fit in what is left of the WQE, the rest is
++ * given back with a "filler" completion and the next WQE is used.
++ */
++static bool mlx5_rq_fill_striding(MLX5State *s, MLX5Rq *rq, MLX5Cq *cq,
++                                  const uint8_t *buf, size_t size,
++                                  MLX5RxDone *done)
++{
++    uint32_t stride_size = 1u << rq->wq.log_stride_size;
++    uint32_t num = 1u << rq->wq.log_num_strides;
++    size_t shift = rq->wq.two_byte_shift ? 2 : 0;
++    uint32_t need = DIV_ROUND_UP(size + shift, stride_size);
++    struct mlx5_wqe_data_seg dseg;
++
++    if (need > num) {
++        trace_mlx5_rx_drop(mlx5_name(s), "frame larger than receive buffer",
++                           size);
++        return false;
++    }
++    for (;;) {
++        if (!rq->cur_valid) {
++            uint16_t pc = mlx5_dbr_read(s, rq->wq.dbr_addr, MLX5_RCV_DBR);
++            uint32_t idx;
++
++            if (pc == rq->cc || !mlx5_rq_ll_next(s, rq, &idx)) {
++                return false;
++            }
++            rq->cur_idx = idx;
++            rq->cur_stride = 0;
++            rq->cur_valid = true;
++        }
++        if (num - rq->cur_stride >= need) {
++            break;
++        }
++        mlx5_rq_striding_filler(s, rq, cq, num - rq->cur_stride);
++    }
++
++    /* The WQE is a link segment and one data segment for the whole buffer. */
++    if (mlx5_buf_rw(s, &rq->wq.buf,
++                    ((uint64_t)rq->cur_idx << rq->wq.log_stride) +
++                    sizeof(struct mlx5_wqe_srq_next_seg), &dseg, sizeof(dseg),
++                    false) != MEMTX_OK ||
++        mlx5_mkey_rw(s, be32_to_cpu(dseg.lkey),
++                     be64_to_cpu(dseg.addr) +
++                     (uint64_t)rq->cur_stride * stride_size + shift,
++                     (uint8_t *)buf, size, true) != MEMTX_OK) {
++        return false;
++    }
++
++    done->wqe_id = rq->cur_idx;
++    done->wqe_counter = rq->cur_stride;
++    done->byte_cnt = need << MLX5_MPWRQ_CQE_STRIDES_SHIFT | size;
++    rq->cur_stride += need;
++    if (rq->cur_stride == num) {
++        mlx5_rq_striding_next(rq);
++    }
+     return true;
+ }
+ 
+@@ -773,7 +945,7 @@ static bool mlx5_rx_hold(MLX5State *s, const MLX5RxTarget *target)
+     MLX5Rq *rq = g_hash_table_lookup(s->rqs, GUINT_TO_POINTER(target->rqn));
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+ 
+-    if (!s->pause_tx || !rq || rq->state != MLX5_RQC_STATE_RDY || !rq->cc ||
++    if (!s->pause_tx || !rq || rq->state != MLX5_RQC_STATE_RDY || !rq->used ||
+         mlx5_rq_has_buffers(s, rq)) {
+         return false;
+     }
+@@ -801,8 +973,8 @@ static void mlx5_rx_deliver(MLX5State *s, const MLX5RxTarget *target,
+     MLX5Rq *rq = g_hash_table_lookup(s->rqs, GUINT_TO_POINTER(target->rqn));
+     MLX5Stats *st = &s->stats;
+     struct mlx5_cqe64 cqe = { };
+-    uint16_t wqe_counter;
+-    bool l3_ok, l4_ok;
++    bool l3_ok, l4_ok, filled;
++    MLX5RxDone done;
+     MLX5PktInfo pi;
+     MLX5Cq *cq;
+ 
+@@ -828,14 +1000,21 @@ static void mlx5_rx_deliver(MLX5State *s, const MLX5RxTarget *target,
+     }
+     mlx5_parse_pkt(buf, size, &pi);
+ 
+-    if (!mlx5_rq_fill(s, rq, buf, size, &wqe_counter)) {
++    if (rq->wq.type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ) {
++        filled = mlx5_rq_fill_striding(s, rq, cq, buf, size, &done);
++    } else {
++        filled = mlx5_rq_fill_list(s, rq, buf, size, &done);
++    }
++    if (!filled) {
+         st->rx_out_of_buffer++;
+         return;
+     }
++    rq->used = true;
+ 
+     cqe.op_own = MLX5_CQE_RESP_SEND << 4;
+-    cqe.byte_cnt = cpu_to_be32(size);
+-    cqe.wqe_counter = cpu_to_be16(wqe_counter);
++    cqe.byte_cnt = cpu_to_be32(done.byte_cnt);
++    cqe.wqe_counter = cpu_to_be16(done.wqe_counter);
++    cqe.wqe_id = cpu_to_be16(done.wqe_id);
+     cqe.flags_rqpn = cpu_to_be32(rq->rqn);
+     /* The low 24 bits carry the matching rule's flow tag. */
+     cqe.sop_drop_qpn = cpu_to_be32(target->flow_tag & 0xffffff);
+@@ -871,7 +1050,7 @@ static void mlx5_rx_deliver(MLX5State *s, const MLX5RxTarget *target,
+     }
+     mlx5_cqe_set_ts(&cqe, ts);
+ 
+-    trace_mlx5_rx(mlx5_name(s), rq->rqn, wqe_counter, size);
++    trace_mlx5_rx(mlx5_name(s), rq->rqn, done.wqe_counter, size);
+     mlx5_cq_post(s, cq, &cqe);
+     s->rx_stalled = false;
+ 
+diff --git a/hw/net/mlx5/mlx5_hw.h b/hw/net/mlx5/mlx5_hw.h
+index e94a68b..14a4c50 100644
+--- a/hw/net/mlx5/mlx5_hw.h
++++ b/hw/net/mlx5/mlx5_hw.h
+@@ -212,15 +212,23 @@ enum {
+ 
+ /* ACCESS_REG register ids. */
+ enum {
++    MLX5_REG_PMLP               = 0x5002,
+     MLX5_REG_PMTU               = 0x5003,
+     MLX5_REG_PTYS               = 0x5004,
+     MLX5_REG_PAOS               = 0x5006,
+     MLX5_REG_PFCC               = 0x5007,
+     MLX5_REG_PPCNT              = 0x5008,
+     MLX5_REG_PMAOS              = 0x5012,
++    MLX5_REG_PPLM               = 0x5023,
+     MLX5_REG_PCMR               = 0x5041,
++    MLX5_REG_PCAM               = 0x507f,
+     MLX5_REG_HOST_ENDIANNESS    = 0x7004,
++    MLX5_REG_MTCAP              = 0x9009,
++    MLX5_REG_MTMP               = 0x900a,
+     MLX5_REG_MCIA               = 0x9014,
++    MLX5_REG_MCQS               = 0x9060,
++    MLX5_REG_MCQI               = 0x9061,
++    MLX5_REG_MCAM               = 0x907f,
+ };
+ 
+ #define MLX5_IEEE_802_3_COUNTERS_GROUP  0x0
+@@ -390,11 +398,68 @@ struct mlx5_wqe_srq_next_seg {
+ } QEMU_PACKED;
+ 
+ enum {
+-    MLX5_OPCODE_NOP     = 0x00,
+-    MLX5_OPCODE_SEND    = 0x0a,
+-    MLX5_OPCODE_LSO     = 0x0e,
++    MLX5_OPCODE_NOP             = 0x00,
++    MLX5_OPCODE_SEND            = 0x0a,
++    MLX5_OPCODE_LSO             = 0x0e,
++    MLX5_OPCODE_UMR             = 0x25,
++    MLX5_OPCODE_ENHANCED_MPSW   = 0x29,
+ };
+ 
++/* Second segment of a UMR WQE: which parts of the memory key to update. */
++struct mlx5_wqe_umr_ctrl_seg {
++    uint8_t flags;
++    uint8_t rsvd0[3];
++    uint16_t xlt_octowords;
++    uint16_t xlt_offset;
++    uint64_t mkey_mask;
++    uint32_t xlt_offset_47_16;
++    uint8_t rsvd1[28];
++} QEMU_PACKED;
++
++enum {
++    MLX5_UMR_TRANSLATION_OFFSET_EN  = 1 << 4,
++    MLX5_UMR_INLINE                 = 1 << 7,
++};
++
++enum {
++    MLX5_MKEY_MASK_LEN          = 1ull << 0,
++    MLX5_MKEY_MASK_PAGE_SIZE    = 1ull << 1,
++    MLX5_MKEY_MASK_START_ADDR   = 1ull << 6,
++    MLX5_MKEY_MASK_FREE         = 1ull << 29,
++};
++
++/* Third segment of a UMR WQE: new memory key attributes. */
++struct mlx5_mkey_seg {
++    uint8_t status;
++    uint8_t pcie_control;
++    uint8_t flags;
++    uint8_t version;
++    uint32_t qpn_mkey7_0;
++    uint8_t rsvd1[4];
++    uint32_t flags_pd;
++    uint64_t start_addr;
++    uint64_t len;
++    uint32_t bsfs_octo_size;
++    uint8_t rsvd2[16];
++    uint32_t xlt_oct_size;
++    uint8_t rsvd3[3];
++    uint8_t log2_page_size;
++    uint8_t rsvd4[4];
++} QEMU_PACKED;
++
++#define MLX5_MKEY_STATUS_FREE   (1 << 6)
++
++/*
++ * Striding receive queues: a WQE is a buffer cut into strides, and each
++ * frame takes as many consecutive strides as it needs.  The context fields
++ * are relative to these bases.
++ */
++#define MLX5_MPWQE_LOG_NUM_STRIDES_BASE     9
++#define MLX5_MPWQE_LOG_STRIDE_SZ_BASE       6
++/* In byte_cnt of such an RQ's CQE: strides used in 30:16, "filler" in 31. */
++#define MLX5_MPWRQ_CQE_STRIDES_SHIFT        16
++#define MLX5_MPWRQ_CQE_FILLER               (1u << 31)
++
+ /* Doorbell record: two big-endian words in guest memory. */
+ enum {
+     MLX5_RCV_DBR        = 0,
+diff --git a/hw/net/mlx5/mlx5_mkey.c b/hw/net/mlx5/mlx5_mkey.c
+new file mode 100644
+index 0000000..a699546
+--- /dev/null
++++ b/hw/net/mlx5/mlx5_mkey.c
+@@ -0,0 +1,272 @@
++/*
++ * Mellanox ConnectX (mlx5) emulation: memory keys
++ *
++ * Every address in a work queue entry comes with a memory key that says how
++ * to interpret it:
++ *
++ *  - PA:  the address is a bus address.
++ *  - MTT: the address indexes a table of equally sized pages.
++ *  - KSM: like MTT, but each table entry points into another memory key.
++ *  - KLM: like KSM with a length per entry.
++ *
++ * The driver creates the tables with CREATE_MKEY and rewrites parts of them
++ * at run time with UMR work queue entries, which is how it rotates fresh
++ * pages into a striding receive queue without issuing commands.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/units.h"
++#include "qemu/log.h"
++#include "mlx5.h"
++#include "../trace.h"
++
++#define MLX5_OCTWORD            16
++#define MLX5_MKEY_MAX_DEPTH     4
++
++/* Read and write permission bits in the low bits of an MTT entry. */
++#define MLX5_MTT_ADDR_MASK      (~0x3ull)
++
++static void mlx5_mkey_free(gpointer data)
++{
++    MLX5Mkey *mkey = data;
++
++    g_free(mkey->xlt);
++    g_free(mkey);
++}
++
++static MLX5Mkey *mlx5_mkey_get(MLX5State *s, uint32_t key)
++{
++    /* The low byte is a variant chosen by the driver, not part of the index. */
++    return g_hash_table_lookup(s->mkeys, GUINT_TO_POINTER(key >> 8));
++}
++
++int mlx5_cmd_create_mkey(MLX5State *s, const uint8_t *in, uint32_t inlen,
++                         uint8_t *out, uint32_t outlen)
++{
++    const uint8_t *mkc, *xlt;
++    uint64_t actual;
++    MLX5Mkey *mkey;
++
++    MLX5_CMD_CHECK_LEN(create_mkey_in, create_mkey_out);
++    mkc = MLX5_ADDR_OF(create_mkey_in, in, memory_key_mkey_entry);
++    xlt = MLX5_ADDR_OF(create_mkey_in, in, klm_pas_mtt);
++
++    mkey = g_new0(MLX5Mkey, 1);
++    mkey->access_mode = MLX5_GET(mkc, mkc, access_mode_4_2) << 2 |
++                        MLX5_GET(mkc, mkc, access_mode_1_0);
++    mkey->free = MLX5_GET(mkc, mkc, free);
++    mkey->start_addr = MLX5_GET64(mkc, mkc, start_addr);
++    mkey->len = MLX5_GET64(mkc, mkc, len);
++    mkey->log_page_size = MLX5_GET(mkc, mkc, log_page_size);
++    mkey->xlt_size = (uint64_t)MLX5_GET(mkc, mkc, translations_octword_size) *
++                     MLX5_OCTWORD;
++    actual = (uint64_t)MLX5_GET(create_mkey_in, in,
++                                translations_octword_actual_size) *
++             MLX5_OCTWORD;
++    if (mkey->xlt_size > MLX5_CMD_MAX_LEN || actual > mkey->xlt_size ||
++        actual > in + inlen - xlt) {
++        g_free(mkey);
++        return MLX5_CMD_STAT_BAD_INP_LEN_ERR;
++    }
++    mkey->xlt = g_malloc0(mkey->xlt_size);
++    memcpy(mkey->xlt, xlt, actual);
++
++    mkey->index = mlx5_alloc_id(s);
++    g_hash_table_insert(s->mkeys, GUINT_TO_POINTER(mkey->index), mkey);
++    trace_mlx5_create_mkey(mkey->index, mkey->access_mode, mkey->free,
++                           mkey->len, mkey->log_page_size, mkey->xlt_size);
++    MLX5_SET(create_mkey_out, out, mkey_index, mkey->index);
++    return MLX5_CMD_STAT_OK;
++}
++
++int mlx5_cmd_destroy_mkey(MLX5State *s, const uint8_t *in, uint32_t inlen,
++                          uint8_t *out, uint32_t outlen)
++{
++    MLX5_CMD_CHECK_LEN(destroy_mkey_in, destroy_mkey_out);
++    if (!g_hash_table_remove(s->mkeys, GUINT_TO_POINTER(
++                                 MLX5_GET(destroy_mkey_in, in, mkey_index)))) {
++        return MLX5_CMD_STAT_BAD_RES_ERR;
++    }
++    return MLX5_CMD_STAT_OK;
++}
++
++static MemTxResult mlx5_mkey_rw_depth(MLX5State *s, uint32_t key, uint64_t va,
++                                      void *buf, uint64_t len, bool is_write,
++                                      unsigned depth)
++{
++    const MLX5Mkey *mkey = mlx5_mkey_get(s, key);
++    uint64_t off, size, idx, in_ent, n;
++    uint8_t *p = buf;
++    const uint8_t *e;
++    MemTxResult res;
++
++    if (!mkey || mkey->free || depth > MLX5_MKEY_MAX_DEPTH) {
++        return MEMTX_DECODE_ERROR;
++    }
++    if (mkey->access_mode == MLX5_MKC_ACCESS_MODE_PA) {
++        return pci_dma_rw(PCI_DEVICE(s), va, buf, len,
++                          is_write ? DMA_DIRECTION_FROM_DEVICE :
++                                     DMA_DIRECTION_TO_DEVICE,
++                          MEMTXATTRS_UNSPECIFIED);
++    }
++
++    off = va - mkey->start_addr;
++    size = 1ull << mkey->log_page_size;
++    while (len) {
++        switch (mkey->access_mode) {
++        case MLX5_MKC_ACCESS_MODE_MTT:
++            idx = off >> mkey->log_page_size;
++            in_ent = off & (size - 1);
++            n = MIN(len, size - in_ent);
++            if ((idx + 1) * 8 > mkey->xlt_size) {
++                return MEMTX_DECODE_ERROR;
++            }
++            res = pci_dma_rw(PCI_DEVICE(s),
++                             (ldq_be_p(mkey->xlt + idx * 8) &
++                              MLX5_MTT_ADDR_MASK) + in_ent, p, n,
++                             is_write ? DMA_DIRECTION_FROM_DEVICE :
++                                        DMA_DIRECTION_TO_DEVICE,
++                             MEMTXATTRS_UNSPECIFIED);
++            break;
++
++        case MLX5_MKC_ACCESS_MODE_KSM:
++            /* Entries: reserved word, key, 64-bit address. */
++            idx = off >> mkey->log_page_size;
++            in_ent = off & (size - 1);
++            n = MIN(len, size - in_ent);
++            if ((idx + 1) * MLX5_OCTWORD > mkey->xlt_size) {
++                return MEMTX_DECODE_ERROR;
++            }
++            e = mkey->xlt + idx * MLX5_OCTWORD;
++            res = mlx5_mkey_rw_depth(s, ldl_be_p(e + 4),
++                                     ldq_be_p(e + 8) + in_ent, p, n, is_write,
++                                     depth + 1);
++            break;
++
++        case MLX5_MKC_ACCESS_MODE_KLMS:
++            /* Entries: byte count, key, 64-bit address.  Find ours. */
++            in_ent = off;
++            for (idx = 0; ; idx++) {
++                if ((idx + 1) * MLX5_OCTWORD > mkey->xlt_size) {
++                    return MEMTX_DECODE_ERROR;
++                }
++                e = mkey->xlt + idx * MLX5_OCTWORD;
++                if (in_ent < ldl_be_p(e)) {
++                    break;
++                }
++                in_ent -= ldl_be_p(e);
++            }
++            n = MIN(len, ldl_be_p(e) - in_ent);
++            res = mlx5_mkey_rw_depth(s, ldl_be_p(e + 4),
++                                     ldq_be_p(e + 8) + in_ent, p, n, is_write,
++                                     depth + 1);
++            break;
++
++        default:
++            return MEMTX_DECODE_ERROR;
++        }
++        if (res != MEMTX_OK) {
++            return res;
++        }
++        p += n;
++        off += n;
++        len -= n;
++    }
++    return MEMTX_OK;
++}
++
++/* Read or write guest memory at an address qualified by a memory key. */
++MemTxResult mlx5_mkey_rw(MLX5State *s, uint32_t key, uint64_t va, void *buf,
++                         uint64_t len, bool is_write)
++{
++    return mlx5_mkey_rw_depth(s, key, va, buf, len, is_write, 0);
++}
++
++/*
++ * UMR work queue entry: update a memory key from a send queue.  After the
++ * control segment come a UMR control segment (what to change), a memory key
++ * segment (new attribute values) and the new translation entries, inline or
++ * as a pointer to them.
++ */
++void mlx5_mkey_umr(MLX5State *s, const uint8_t *wqe, size_t wqe_len)
++{
++    const struct mlx5_wqe_ctrl_seg *ctrl = (const void *)wqe;
++    const struct mlx5_wqe_umr_ctrl_seg *uctrl = (const void *)(ctrl + 1);
++    const struct mlx5_mkey_seg *mkseg = (const void *)(uctrl + 1);
++    const uint8_t *data = (const void *)(mkseg + 1);
++    uint64_t mask, bytes, off;
++    MLX5Mkey *mkey;
++
++    if (wqe_len < data - wqe) {
++        goto bad;
++    }
++    mkey = mlx5_mkey_get(s, be32_to_cpu(ctrl->imm));
++    if (!mkey) {
++        goto bad;
++    }
++    mask = be64_to_cpu(uctrl->mkey_mask);
++    bytes = (uint64_t)be16_to_cpu(uctrl->xlt_octowords) * MLX5_OCTWORD;
++    off = be16_to_cpu(uctrl->xlt_offset);
++    if (uctrl->flags & MLX5_UMR_TRANSLATION_OFFSET_EN) {
++        off |= (uint64_t)be32_to_cpu(uctrl->xlt_offset_47_16) << 16;
++    } else {
++        off = 0;
++    }
++    off *= MLX5_OCTWORD;
++
++    if (bytes) {
++        if (off + bytes > mkey->xlt_size) {
++            goto bad;
++        }
++        if (uctrl->flags & MLX5_UMR_INLINE) {
++            if (bytes > wqe + wqe_len - data) {
++                goto bad;
++            }
++            memcpy(mkey->xlt + off, data, bytes);
++        } else {
++            const struct mlx5_wqe_data_seg *dseg = (const void *)data;
++
++            if (sizeof(*dseg) > wqe + wqe_len - data ||
++                mlx5_mkey_rw(s, be32_to_cpu(dseg->lkey),
++                             be64_to_cpu(dseg->addr), mkey->xlt + off, bytes,
++                             false) != MEMTX_OK) {
++                goto bad;
++            }
++        }
++    }
++
++    if (mask & MLX5_MKEY_MASK_FREE) {
++        mkey->free = mkseg->status & MLX5_MKEY_STATUS_FREE;
++    }
++    if (mask & MLX5_MKEY_MASK_LEN) {
++        mkey->len = be64_to_cpu(mkseg->len);
++    }
++    if (mask & MLX5_MKEY_MASK_START_ADDR) {
++        mkey->start_addr = be64_to_cpu(mkseg->start_addr);
++    }
++    if (mask & MLX5_MKEY_MASK_PAGE_SIZE) {
++        mkey->log_page_size = mkseg->log2_page_size;
++    }
++    trace_mlx5_umr(mkey->index, off, bytes, mkey->free);
++    return;
++
++bad:
++    qemu_log_mask(LOG_GUEST_ERROR, "mlx5: malformed UMR WQE\n");
++}
++
++void mlx5_mkey_reset(MLX5State *s)
++{
++    g_hash_table_remove_all(s->mkeys);
++}
++
++void mlx5_mkey_init(MLX5State *s)
++{
++    s->mkeys = g_hash_table_new_full(NULL, NULL, NULL, mlx5_mkey_free);
++}
++
++void mlx5_mkey_cleanup(MLX5State *s)
++{
++    g_hash_table_destroy(s->mkeys);
++}
+diff --git a/hw/net/mlx5/mlx5_reg.c b/hw/net/mlx5/mlx5_reg.c
+new file mode 100644
+index 0000000..793248c
+--- /dev/null
++++ b/hw/net/mlx5/mlx5_reg.c
+@@ -0,0 +1,521 @@
++/*
++ * Mellanox ConnectX (mlx5) emulation: port and management registers
++ *
++ * The ACCESS_REG command reads and writes registers that describe the port
++ * (MTU, link modes, FEC, flow control, counters), the cable plugged into it,
++ * and the board (firmware components, temperature).  Two of them, PCAM and
++ * MCAM, are masks of which other registers and features exist.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "mlx5.h"
++#include "../trace.h"
++
++/* FEC modes, as bits in the PPLM register's fields */
++#define MLX5_FEC_NONE           (1 << 0)
++#define MLX5_FEC_FIRECODE       (1 << 1)
++#define MLX5_FEC_RS             (1 << 2)
++
++/* PTYS values */
++#define MLX5_PTYS_AN_COMPLETE   1
++#define MLX5_PTYS_CONNECTOR_DA  7       /* direct attach copper */
++
++/* MCQS/MCQI: the one firmware component is the boot image */
++#define MLX5_MCQS_IDENTIFIER_BOOT_IMG   1
++#define MLX5_MCQI_INFO_TYPE_VERSION     1
++
++/* Temperatures are in units of 1/8 degree Celsius. */
++#define MLX5_MTMP_DEG(c)        ((c) * 8)
++
++/*
++ * Link modes of a ConnectX-5, by bit in the PTYS register's protocol masks.
++ * The first entry of each speed is the one reported as operational: the
++ * modelled cable is a passive copper one.
++ */
++static const struct {
++    uint8_t bit;
++    uint32_t speed;
++} mlx5_link_modes[] = {
++    { 20, 100000 },     /* 100GBASE-CR4 */
++    { 21, 100000 },     /* 100GBASE-SR4 */
++    { 22, 100000 },     /* 100GBASE-KR4 */
++    { 23, 100000 },     /* 100GBASE-LR4 */
++    { 30, 50000 },      /* 50GBASE-CR2 */
++    { 31, 50000 },      /* 50GBASE-KR2 */
++    { 18, 50000 },      /* 50GBASE-SR2 */
++    { 6, 40000 },       /* 40GBASE-CR4 */
++    { 7, 40000 },       /* 40GBASE-KR4 */
++    { 15, 40000 },      /* 40GBASE-SR4 */
++    { 16, 40000 },      /* 40GBASE-LR4 */
++    { 27, 25000 },      /* 25GBASE-CR */
++    { 28, 25000 },      /* 25GBASE-KR */
++    { 29, 25000 },      /* 25GBASE-SR */
++    { 12, 10000 },      /* 10GBASE-CR */
++    { 4, 10000 },       /* 10GBASE-KR */
++    { 13, 10000 },      /* 10GBASE-SR */
++    { 1, 1000 },        /* 1000BASE-KX */
++};
++
++/* Everything up to the speed the port was configured with. */
++static uint32_t mlx5_proto_cap(MLX5State *s)
++{
++    uint32_t mask = 0;
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(mlx5_link_modes); i++) {
++        if (mlx5_link_modes[i].speed <= s->link_speed) {
++            mask |= 1u << mlx5_link_modes[i].bit;
++        }
++    }
++    /* An unlisted speed property still has to yield a usable port. */
++    return mask ?: 1u << mlx5_link_modes[0].bit;
++}
++
++static uint32_t mlx5_proto_admin(MLX5State *s)
++{
++    uint32_t cap = mlx5_proto_cap(s);
++
++    return s->ptys_admin & cap ?: cap;
++}
++
++/* The fastest mode both "sides" allow; the table is sorted by speed. */
++static uint32_t mlx5_proto_oper(MLX5State *s, uint32_t *speed)
++{
++    uint32_t admin = mlx5_proto_admin(s);
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(mlx5_link_modes); i++) {
++        if (admin & (1u << mlx5_link_modes[i].bit)) {
++            *speed = mlx5_link_modes[i].speed;
++            return 1u << mlx5_link_modes[i].bit;
++        }
++    }
++    *speed = 0;
++    return 0;
++}
++
++static int mlx5_reg_ptys(MLX5State *s, bool write, uint8_t *data)
++{
++    uint32_t speed;
++    uint32_t oper = mlx5_proto_oper(s, &speed);
++
++    if (write) {
++        s->ptys_admin = MLX5_GET(ptys_reg, data, eth_proto_admin);
++        s->an_disable = MLX5_GET(ptys_reg, data, an_disable_admin);
++        if (mlx5_proto_oper(s, &speed) != oper && mlx5_link_up(s)) {
++            /* The link retrains at the new speed. */
++            mlx5_port_event(s);
++        }
++        return MLX5_CMD_STAT_OK;
++    }
++    MLX5_SET(ptys_reg, data, an_disable_cap, 1);
++    MLX5_SET(ptys_reg, data, an_disable_admin, s->an_disable);
++    MLX5_SET(ptys_reg, data, an_status, MLX5_PTYS_AN_COMPLETE);
++    MLX5_SET(ptys_reg, data, connector_type, MLX5_PTYS_CONNECTOR_DA);
++    MLX5_SET(ptys_reg, data, eth_proto_capability, mlx5_proto_cap(s));
++    MLX5_SET(ptys_reg, data, eth_proto_admin, mlx5_proto_admin(s));
++    if (mlx5_link_up(s)) {
++        MLX5_SET(ptys_reg, data, eth_proto_oper, oper);
++        /* The link partner is taken to offer whatever we do. */
++        MLX5_SET(ptys_reg, data, eth_proto_lp_advertise,
++                 mlx5_proto_admin(s));
++    }
++    return MLX5_CMD_STAT_OK;
++}
++
++/* Forward error correction: what each speed class can do, and what is on. */
++static int mlx5_reg_pplm(MLX5State *s, bool write, uint8_t *data)
++{
++    uint32_t speed, admin, active;
++
++    if (write) {
++        memcpy(s->pplm, data, sizeof(s->pplm));
++        return MLX5_CMD_STAT_OK;
++    }
++    memcpy(data, s->pplm, sizeof(s->pplm));
++    MLX5_SET(pplm_reg, data, local_port, 1);
++    MLX5_SET(pplm_reg, data, fec_override_cap_10g_40g,
++             MLX5_FEC_NONE | MLX5_FEC_FIRECODE);
++    MLX5_SET(pplm_reg, data, fec_override_cap_25g,
++             MLX5_FEC_NONE | MLX5_FEC_FIRECODE | MLX5_FEC_RS);
++    MLX5_SET(pplm_reg, data, fec_override_cap_50g,
++             MLX5_FEC_NONE | MLX5_FEC_FIRECODE | MLX5_FEC_RS);
++    MLX5_SET(pplm_reg, data, fec_override_cap_100g,
++             MLX5_FEC_NONE | MLX5_FEC_RS);
++
++    /* Zero in an "admin" field means automatic selection. */
++    mlx5_proto_oper(s, &speed);
++    switch (speed) {
++    case 100000:
++        admin = MLX5_GET(pplm_reg, data, fec_override_admin_100g);
++        active = MLX5_FEC_RS;
++        break;
++    case 50000:
++        admin = MLX5_GET(pplm_reg, data, fec_override_admin_50g);
++        active = MLX5_FEC_RS;
++        break;
++    case 25000:
++        admin = MLX5_GET(pplm_reg, data, fec_override_admin_25g);
++        active = MLX5_FEC_RS;
++        break;
++    default:
++        admin = MLX5_GET(pplm_reg, data, fec_override_admin_10g_40g);
++        active = MLX5_FEC_NONE;
++        break;
++    }
++    if (admin) {
++        active = admin & MLX5_FEC_RS ?: admin & MLX5_FEC_FIRECODE ?:
++                 MLX5_FEC_NONE;
++    }
++    MLX5_SET(pplm_reg, data, fec_mode_active, mlx5_link_up(s) ? active : 0);
++    return MLX5_CMD_STAT_OK;
++}
++
++#define PPCNT_SET(data, fld, val)                                           \
++    do {                                                                    \
++        MLX5_SET(ppcnt_reg, data,                                           \
++                 counter_set.eth_802_3_cntrs_grp_data_layout.fld ## _high,  \
++                 (val) >> 32);                                              \
++        MLX5_SET(ppcnt_reg, data,                                           \
++                 counter_set.eth_802_3_cntrs_grp_data_layout.fld ## _low,   \
++                 (val));                                                    \
++    } while (0)
++
++/* Port counters.  Only the IEEE 802.3 group has anything to report. */
++static void mlx5_reg_ppcnt(MLX5State *s, uint8_t *data)
++{
++    MLX5Stats *st = &s->stats;
++
++    if (MLX5_GET(ppcnt_reg, data, grp) != MLX5_IEEE_802_3_COUNTERS_GROUP) {
++        return;
++    }
++    PPCNT_SET(data, a_frames_transmitted_ok, st->tx_packets);
++    PPCNT_SET(data, a_frames_received_ok, st->rx_phy_packets);
++    PPCNT_SET(data, a_octets_transmitted_ok, st->tx_bytes);
++    PPCNT_SET(data, a_octets_received_ok, st->rx_phy_bytes);
++    PPCNT_SET(data, a_multicast_frames_xmitted_ok, st->tx_mcast_packets);
++    PPCNT_SET(data, a_broadcast_frames_xmitted_ok, st->tx_bcast_packets);
++    PPCNT_SET(data, a_multicast_frames_received_ok, st->rx_mcast_packets);
++    PPCNT_SET(data, a_broadcast_frames_received_ok, st->rx_bcast_packets);
++}
++
++/* Pad or cut a string to fill a fixed-width, space-padded EEPROM field. */
++static void mlx5_eeprom_str(uint8_t *field, size_t len, const char *str)
++{
++    size_t n = MIN(len, strlen(str));
++
++    memset(field, ' ', len);
++    memcpy(field, str, n);
++}
++
++static uint8_t mlx5_eeprom_sum(const uint8_t *eeprom, size_t first,
++                               size_t last)
++{
++    uint8_t sum = 0;
++
++    while (first <= last) {
++        sum += eeprom[first++];
++    }
++    return sum;
++}
++
++/*
++ * The cable: page 0 of the SFF-8636 memory map of a one metre QSFP28
++ * passive copper cable, which is all a flat-memory module has.
++ */
++static void mlx5_module_eeprom(MLX5State *s, uint8_t *eeprom)
++{
++    char serial[17];
++
++    memset(eeprom, 0, 256);
++    eeprom[0] = 0x11;           /* identifier: QSFP28 */
++    eeprom[1] = 0x07;           /* revision: SFF-8636 2.7 */
++    eeprom[2] = 0x04;           /* flat memory: no pages beyond this one */
++
++    eeprom[128] = 0x11;         /* identifier again */
++    eeprom[130] = 0x23;         /* connector: no separable connector */
++    eeprom[131] = 0x80;         /* compliance: see extended code */
++    eeprom[140] = 0xff;         /* nominal bit rate: see byte 222 */
++    eeprom[146] = 1;            /* copper length, metres */
++    eeprom[147] = 0xa0;         /* technology: passive copper, unequalized */
++    mlx5_eeprom_str(eeprom + 148, 16, "QEMU");
++    mlx5_eeprom_str(eeprom + 168, 16, "MLX5-DAC-1M");
++    mlx5_eeprom_str(eeprom + 184, 2, "A1");
++    eeprom[191] = mlx5_eeprom_sum(eeprom, 128, 190);
++
++    eeprom[192] = 0x0b;         /* extended compliance: 100GBASE-CR4 */
++    snprintf(serial, sizeof(serial), "%02X%02X%02X%02X%02X%02X",
++             s->conf.macaddr.a[0], s->conf.macaddr.a[1], s->conf.macaddr.a[2],
++             s->conf.macaddr.a[3], s->conf.macaddr.a[4], s->conf.macaddr.a[5]);
++    mlx5_eeprom_str(eeprom + 196, 16, serial);
++    mlx5_eeprom_str(eeprom + 212, 8, "260101");
++    eeprom[222] = 103;          /* nominal bit rate, units of 250 Mb/s */
++    eeprom[223] = mlx5_eeprom_sum(eeprom, 192, 222);
++}
++
++/* Module EEPROM access, as an I2C read of up to 48 bytes. */
++static int mlx5_reg_mcia(MLX5State *s, uint8_t *data)
++{
++    uint8_t eeprom[256];
++    uint32_t addr = MLX5_GET(mcia_reg, data, device_address);
++    uint32_t size = MLX5_GET(mcia_reg, data, size);
++    uint8_t *out = MLX5_ADDR_OF(mcia_reg, data, dwords);
++
++    if (MLX5_GET(mcia_reg, data, module) != 0 ||
++        MLX5_GET(mcia_reg, data, i2c_device_address) != 0x50 ||
++        MLX5_GET(mcia_reg, data, page_number) != 0 ||
++        size > MLX5_FLD_SZ_BYTES(mcia_reg, dwords) ||
++        addr + size > sizeof(eeprom)) {
++        MLX5_SET(mcia_reg, data, status, 1);
++        return MLX5_CMD_STAT_OK;
++    }
++    mlx5_module_eeprom(s, eeprom);
++    memcpy(out, eeprom + addr, size);
++    MLX5_SET(mcia_reg, data, status, 0);
++    return MLX5_CMD_STAT_OK;
++}
++
++/* Which registers and optional features exist. */
++static void mlx5_reg_pcam(uint8_t *data)
++{
++    uint8_t *regs = MLX5_ADDR_OF(pcam_reg, data, port_access_reg_cap_mask);
++    uint8_t *feat = MLX5_ADDR_OF(pcam_reg, data, feature_cap_mask);
++
++    if (MLX5_GET(pcam_reg, data, access_reg_group) != 0 ||
++        MLX5_GET(pcam_reg, data, feature_group) != 0) {
++        return;
++    }
++    MLX5_SET(pcam_regs_5000_to_507f, regs, pplm, 1);
++    MLX5_SET(pcam_regs_5000_to_507f, regs, ppcnt, 1);
++    MLX5_SET(pcam_enhanced_features, feat, ptys_connector_type, 1);
++    MLX5_SET(pcam_enhanced_features, feat, pfcc_mask, 1);
++}
++
++static void mlx5_reg_mcam(uint8_t *data)
++{
++    uint8_t *regs = MLX5_ADDR_OF(mcam_reg, data, mng_access_reg_cap_mask);
++
++    if (MLX5_GET(mcam_reg, data, access_reg_group) != 0 ||
++        MLX5_GET(mcam_reg, data, feature_group) != 0) {
++        return;
++    }
++    MLX5_SET(mcam_access_reg, regs, mcqi, 1);
++    MLX5_SET(mcam_access_reg, regs, mcqs, 1);
++    MLX5_SET(mcam_access_reg, regs, mtmp, 1);
++}
++
++/* Firmware components: there is one, the running image. */
++static int mlx5_reg_mcqs(uint8_t *data)
++{
++    if (MLX5_GET(mcqs_reg, data, component_index) != 0) {
++        return MLX5_CMD_STAT_BAD_PARAM_ERR;
++    }
++    MLX5_SET(mcqs_reg, data, last_index_flag, 1);
++    MLX5_SET(mcqs_reg, data, identifier, MLX5_MCQS_IDENTIFIER_BOOT_IMG);
++    return MLX5_CMD_STAT_OK;
++}
++
++static int mlx5_reg_mcqi(MLX5State *s, uint8_t *data, uint32_t len)
++{
++    uint8_t *ver = MLX5_ADDR_OF(mcqi_reg, data, data);
++    g_autofree char *str = NULL;
++
++    if (MLX5_GET(mcqi_reg, data, component_index) != 0 ||
++        MLX5_GET(mcqi_reg, data, info_type) != MLX5_MCQI_INFO_TYPE_VERSION) {
++        return MLX5_CMD_STAT_BAD_PARAM_ERR;
++    }
++    if (len < MLX5_ST_SZ_BYTES(mcqi_reg) + MLX5_ST_SZ_BYTES(mcqi_version)) {
++        return MLX5_CMD_STAT_BAD_INP_LEN_ERR;
++    }
++    str = g_strdup_printf("%u.%u.%04u", s->fw_major, s->fw_minor, s->fw_sub);
++    MLX5_SET(mcqi_reg, data, info_size, MLX5_ST_SZ_BYTES(mcqi_version));
++    MLX5_SET(mcqi_version, ver, version,
++             (uint32_t)s->fw_major << 24 | (s->fw_minor & 0xff) << 16 |
++             s->fw_sub);
++    MLX5_SET(mcqi_version, ver, version_string_length, strlen(str));
++    memcpy(MLX5_ADDR_OF(mcqi_version, ver, version_string), str, strlen(str));
++    return MLX5_CMD_STAT_OK;
++}
++
++/* One temperature sensor, on the ASIC, sitting at a steady 45 degrees. */
++static void mlx5_reg_mtmp(uint8_t *data)
++{
++    if (MLX5_GET(mtmp_reg, data, sensor_index) != 0) {
++        /* A zero temperature reads as "no such sensor". */
++        return;
++    }
++    MLX5_SET(mtmp_reg, data, temperature, MLX5_MTMP_DEG(45));
++    MLX5_SET(mtmp_reg, data, max_temperature, MLX5_MTMP_DEG(45));
++    MLX5_SET(mtmp_reg, data, temp_threshold_hi, MLX5_MTMP_DEG(105));
++    memcpy(MLX5_ADDR_OF(mtmp_reg, data, sensor_name_hi), "asic\0\0\0", 8);
++}
++
++/*
++ * Access one register.  @data holds the register as the driver sent it and,
++ * for reads, receives the device's values.
++ */
++int mlx5_access_reg(MLX5State *s, uint16_t reg_id, bool write, uint8_t *data,
++                    uint32_t len)
++{
++    bool was_up = mlx5_link_up(s);
++
++#define REG_CHECK_LEN(typ)                                              \
++    do {                                                                \
++        if (len < MLX5_ST_SZ_BYTES(typ)) {                              \
++            return MLX5_CMD_STAT_BAD_INP_LEN_ERR;                       \
++        }                                                               \
++    } while (0)
++
++    switch (reg_id) {
++    case MLX5_REG_HOST_ENDIANNESS:
++        return MLX5_CMD_STAT_OK;
++
++    case MLX5_REG_PMTU:
++        REG_CHECK_LEN(pmtu_reg);
++        if (write) {
++            s->admin_mtu = MLX5_GET(pmtu_reg, data, admin_mtu);
++        } else {
++            MLX5_SET(pmtu_reg, data, max_mtu, MLX5_MAX_MTU);
++            MLX5_SET(pmtu_reg, data, admin_mtu, s->admin_mtu);
++            MLX5_SET(pmtu_reg, data, oper_mtu, s->admin_mtu);
++        }
++        return MLX5_CMD_STAT_OK;
++
++    case MLX5_REG_PAOS:
++        REG_CHECK_LEN(paos_reg);
++        if (write) {
++            /* "ase" marks the admin state as being updated. */
++            if (MLX5_GET(paos_reg, data, ase)) {
++                s->port_admin_up =
++                    MLX5_GET(paos_reg, data, admin_status) == MLX5_PORT_UP;
++                if (mlx5_link_up(s) != was_up) {
++                    mlx5_port_event(s);
++                }
++            }
++        } else {
++            MLX5_SET(paos_reg, data, admin_status,
++                     s->port_admin_up ? MLX5_PORT_UP : MLX5_PORT_DOWN);
++            MLX5_SET(paos_reg, data, oper_status,
++                     was_up ? MLX5_PORT_UP : MLX5_PORT_DOWN);
++        }
++        return MLX5_CMD_STAT_OK;
++
++    case MLX5_REG_PTYS:
++        REG_CHECK_LEN(ptys_reg);
++        return mlx5_reg_ptys(s, write, data);
++
++    case MLX5_REG_PPLM:
++        REG_CHECK_LEN(pplm_reg);
++        return mlx5_reg_pplm(s, write, data);
++
++    case MLX5_REG_PPCNT:
++        REG_CHECK_LEN(ppcnt_reg);
++        if (!write) {
++            mlx5_reg_ppcnt(s, data);
++        }
++        return MLX5_CMD_STAT_OK;
++
++    case MLX5_REG_PFCC:
++        /* Global pause (link-level flow control) settings. */
++        REG_CHECK_LEN(pfcc_reg);
++        if (write) {
++            /* A set "mask_n" bit leaves that direction as it is. */
++            if (!MLX5_GET(pfcc_reg, data, pprx_mask_n)) {
++                s->pause_rx = MLX5_GET(pfcc_reg, data, pprx);
++            }
++            if (!MLX5_GET(pfcc_reg, data, pptx_mask_n)) {
++                s->pause_tx = MLX5_GET(pfcc_reg, data, pptx);
++            }
++        } else {
++            MLX5_SET(pfcc_reg, data, pprx, s->pause_rx);
++            MLX5_SET(pfcc_reg, data, aprx, s->pause_rx);
++            MLX5_SET(pfcc_reg, data, pptx, s->pause_tx);
++            MLX5_SET(pfcc_reg, data, aptx, s->pause_tx);
++        }
++        return MLX5_CMD_STAT_OK;
++
++    case MLX5_REG_PMLP:
++        /* All four lanes of the port go to module 0. */
++        REG_CHECK_LEN(pmlp_reg);
++        if (!write) {
++            MLX5_SET(pmlp_reg, data, width, 4);
++        }
++        return MLX5_CMD_STAT_OK;
++
++    case MLX5_REG_PMAOS:
++        REG_CHECK_LEN(pmaos_reg);
++        if (!write) {
++            /* Module plugged in and enabled. */
++            MLX5_SET(pmaos_reg, data, admin_status, 1);
++            MLX5_SET(pmaos_reg, data, oper_status, 1);
++        }
++        return MLX5_CMD_STAT_OK;
++
++    case MLX5_REG_MCIA:
++        REG_CHECK_LEN(mcia_reg);
++        return write ? MLX5_CMD_STAT_OK : mlx5_reg_mcia(s, data);
++
++    case MLX5_REG_PCAM:
++        REG_CHECK_LEN(pcam_reg);
++        if (!write) {
++            mlx5_reg_pcam(data);
++        }
++        return MLX5_CMD_STAT_OK;
++
++    case MLX5_REG_MCAM:
++        REG_CHECK_LEN(mcam_reg);
++        if (!write) {
++            mlx5_reg_mcam(data);
++        }
++        return MLX5_CMD_STAT_OK;
++
++    case MLX5_REG_MCQS:
++        REG_CHECK_LEN(mcqs_reg);
++        return write ? MLX5_CMD_STAT_OK : mlx5_reg_mcqs(data);
++
++    case MLX5_REG_MCQI:
++        REG_CHECK_LEN(mcqi_reg);
++        return write ? MLX5_CMD_STAT_OK : mlx5_reg_mcqi(s, data, len);
++
++    case MLX5_REG_MTCAP:
++        REG_CHECK_LEN(mtcap_reg);
++        if (!write) {
++            MLX5_SET(mtcap_reg, data, sensor_count, 1);
++            MLX5_SET64(mtcap_reg, data, sensor_map, 1);
++        }
++        return MLX5_CMD_STAT_OK;
++
++    case MLX5_REG_MTMP:
++        REG_CHECK_LEN(mtmp_reg);
++        if (!write) {
++            mlx5_reg_mtmp(data);
++        }
++        return MLX5_CMD_STAT_OK;
++
++    default:
++        /*
++         * Unmodelled registers read as zero, which the driver takes as
++         * "nothing supported" for the optional features they describe.
++         */
++        qemu_log_mask(LOG_UNIMP, "mlx5: ACCESS_REG %s of register 0x%x\n",
++                      write ? "write" : "read", reg_id);
++        if (!write) {
++            memset(data, 0, len);
++        }
++        return MLX5_CMD_STAT_OK;
++    }
++#undef REG_CHECK_LEN
++}
++
++void mlx5_reg_reset(MLX5State *s)
++{
++    s->ptys_admin = 0;
++    s->an_disable = false;
++    memset(s->pplm, 0, sizeof(s->pplm));
++    /* Flow control is on in both directions by default, as on hardware. */
++    s->pause_rx = true;
++    s->pause_tx = true;
++}
+diff --git a/hw/net/trace-events b/hw/net/trace-events
+index 39d955c..a47f726 100644
+--- a/hw/net/trace-events
++++ b/hw/net/trace-events
+@@ -544,6 +544,10 @@ mlx5_create_rq(uint32_t rqn, uint32_t cqn, uint8_t type, uint8_t log_size, uint8
+ mlx5_modify_rq(uint32_t rqn, uint8_t state, bool vlan_strip) "rqn 0x%x state %u vlan_strip %d"
+ mlx5_set_rqt(uint32_t rqtn, uint32_t size, uint32_t first) "rqtn 0x%x size %u first rqn 0x%x"
+ 
++# mlx5/mlx5_mkey.c
++mlx5_create_mkey(uint32_t index, uint8_t mode, bool free, uint64_t len, uint8_t log_page_size, uint64_t xlt_size) "index 0x%x access mode %u free %d len 0x%"PRIx64" log_page_size %u translation bytes %"PRIu64
++mlx5_umr(uint32_t index, uint64_t off, uint64_t bytes, bool free) "mkey index 0x%x translation offset %"PRIu64" bytes %"PRIu64" free %d"
++
+ # mlx5/mlx5_fs.c
+ mlx5_flow_table(uint32_t id, uint8_t type, bool miss_fwd, uint32_t miss_id) "table 0x%x type %u miss forward %d to table 0x%x"
+ mlx5_flow_root(uint32_t id) "receive root table 0x%x"
