@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Broyojo <dha@xoba.com>
+Date: Tue, 6 Oct 2026 15:59:06 -0400
+Subject: [PATCH 4/4] hw/net/mlx5: function-level reset, NIC interface disabled
+ after reset
+
+Advertise and implement PCIe function-level reset.  After any reset,
+report the NIC interface state as disabled until the driver sets up the
+command queue again, as the hardware does: a driver that was running when
+the device was reset sees this in its health poll and reinitializes
+instead of talking to a device that has forgotten everything.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DntkPG3Xz6WwgDaRoET5gX
+---
+ hw/net/mlx5/mlx5.c | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/hw/net/mlx5/mlx5.c b/hw/net/mlx5/mlx5.c
+index 5cd65ad..3712b1c 100644
+--- a/hw/net/mlx5/mlx5.c
++++ b/hw/net/mlx5/mlx5.c
+@@ -110,7 +110,12 @@ static void mlx5_reset(MLX5State *s)
+     s->rx_stalled = false;
+     qemu_flush_queued_packets(qemu_get_queue(s->nic));
+     s->cmdq_addr = 0;
+-    s->nic_ifc = MLX5_NIC_IFC_FULL;
++    /*
++     * The NIC interface stays "disabled" until the driver hands over a
++     * command queue.  A driver that was running when the device got reset
++     * sees this in its health poll and reinitializes.
++     */
++    s->nic_ifc = MLX5_NIC_IFC_DISABLED;
+     s->db_latch = 0;
+ }
+ 
+@@ -178,9 +183,7 @@ static void mlx5_iseg_write(MLX5State *s, hwaddr addr, uint32_t val)
+         s->cmdq_addr = (s->cmdq_addr & ~0xffffffffull) | (val & 0xfffff000);
+         s->nic_ifc = (val >> MLX5_NIC_IFC_OFFSET) & 7;
+         if (s->nic_ifc == MLX5_NIC_IFC_SW_RESET) {
+-            /* The driver waits for "disabled" before reinitializing. */
+             mlx5_reset(s);
+-            s->nic_ifc = MLX5_NIC_IFC_DISABLED;
+         }
+         break;
+     case offsetof(struct mlx5_init_seg, cmd_dbell):
+@@ -283,6 +286,14 @@ static NetClientInfo mlx5_net_info = {
+     .link_status_changed = mlx5_nc_link_status_changed,
+ };
+ 
++static void mlx5_write_config(PCIDevice *pci_dev, uint32_t addr, uint32_t val,
++                              int len)
++{
++    pci_default_write_config(pci_dev, addr, val, len);
++    /* Function-level reset, which the driver's PCI reset handlers rely on. */
++    pcie_cap_flr_write_config(pci_dev, addr, val, len);
++}
++
+ static void mlx5_realize(PCIDevice *pci_dev, Error **errp)
+ {
+     MLX5State *s = MLX5(pci_dev);
+@@ -329,6 +340,9 @@ static void mlx5_realize(PCIDevice *pci_dev, Error **errp)
+     }
+     pci_dev->config[MLX5_PCI_VSC_OFFSET + PCI_CAP_FLAGS] = MLX5_PCI_VSC_SIZE;
+ 
++    pcie_cap_flr_init(pci_dev);
++    pci_dev->config_write = mlx5_write_config;
++
+     /* What a ConnectX-5 trains to: 8 GT/s, 16 lanes. */
+     pcie_cap_fill_link_ep_usp(pci_dev, QEMU_PCI_EXP_LNK_X16,
+                               QEMU_PCI_EXP_LNK_8GT, false);

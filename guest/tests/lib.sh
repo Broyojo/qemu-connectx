@@ -40,10 +40,12 @@ stat() {
     ethtool -S "$1" | awk -v k="$2:" '$1 == k { print $2 }'
 }
 
-# Kernel log must be free of driver errors and checksum complaints.
-dmesg_clean() {
-    ! dmesg | grep -i -E "hw csum failure|WARNING:|BUG:|Call trace|\
+# Kernel log must be free of driver errors and checksum complaints.  A test
+# that provokes driver errors on purpose can narrow DMESG_BAD.
+DMESG_BAD="hw csum failure|WARNING:|BUG:|Call trace|\
 mlx5_core.*(err|fail|timeout|syndrome)"
+dmesg_clean() {
+    ! dmesg | grep -i -E "$DMESG_BAD"
 }
 
 finish() {

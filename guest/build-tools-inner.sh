@@ -47,14 +47,14 @@ for t in hwstamp_ctl ptp4l phc_ctl phc2sys pmc ts2phc; do
 done
 
 # iproute2 with libbpf: the distribution's "ip" cannot load the selftests'
-# XDP programs.
+# XDP programs.  Also provides devlink.
 git clone -q --depth 1 -b "${IPROUTE2_TAG:-v6.18.0}" \
     https://git.kernel.org/pub/scm/network/iproute2/iproute2.git \
     /tmp/iproute2 2>/dev/null
 (cd /tmp/iproute2 && ./configure >/dev/null 2>&1 &&
  echo "LDLIBS += -lbpf -lelf -lz -lzstd -lmnl" >> config.mk &&
- make -j8 SHARED_LIBS=n LDFLAGS=-static SUBDIRS="lib ip" \
+ make -j8 SHARED_LIBS=n LDFLAGS=-static SUBDIRS="lib ip devlink" \
      >/tmp/iproute2.log 2>&1) || { tail -20 /tmp/iproute2.log; exit 1; }
-cp /tmp/iproute2/ip/ip "$out/bin/"
+cp /tmp/iproute2/ip/ip /tmp/iproute2/devlink/devlink "$out/bin/"
 
 find "$out" -type f | sort

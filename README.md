@@ -49,11 +49,13 @@ What works:
 - XDP (native and generic) and AF_XDP sockets.
 - Port, vport and queue counters; the driver's `ethtool -t` self-test
   including loopback.
+- `devlink` reload and PCI function-level reset, with the driver recovering
+  through its health poll as it does on hardware.
 
 Not modelled:
 
-- RDMA/RoCE (`mlx5_ib` has not been tried against the device), SR-IOV, the
-  e-switch and sub-functions.
+- RDMA/RoCE, SR-IOV, the e-switch and sub-functions. If `mlx5_ib` is loaded
+  its probe fails with `-ENOMEM` and the netdev carries on unaffected.
 - Striding (multi-packet) receive queues, multi-packet send WQEs and CQE
   compression. The driver falls back to its "legacy" receive queue; a real
   ConnectX-5 would default to the striding one.
@@ -131,6 +133,7 @@ guest/run.sh guest/tests/hwts.sh
 export NICS="$(guest/tests/pair-nics)"
 guest/run.sh guest/tests/pair.sh          # traffic, offloads, steering, reload
 guest/run.sh guest/tests/ptp.sh           # PHC tools and ptp4l synchronisation
+guest/run.sh guest/tests/robust.sh        # MAC change, devlink reload, PCI reset
 SMP=8 guest/run.sh guest/tests/ksft.sh    # the kernel's driver selftests
 ```
 
@@ -139,6 +142,7 @@ SMP=8 guest/run.sh guest/tests/ksft.sh    # the kernel's driver selftests
 | `hwts.sh` | `HWTSTAMP_FILTER_ALL` via `SIOCSHWTSTAMP`; TX and RX hardware timestamps on a packet socket, checked against the PHC | pass |
 | `pair.sh` | ping, TCP/UDP iperf3 over IPv4/IPv6, TSO, UDP segmentation, checksums, MAC filter, promiscuous mode, `ethtool -N` rules, jumbo, VLAN, ring/channel resize, link flap, `ethtool -t`, driver reload | pass (36 checks); TCP at about 6 Gbit/s with no drops or retransmits |
 | `ptp.sh` | kernel `testptp` and `hwtstamp_config`, linuxptp `phc_ctl`/`hwstamp_ctl`, `ptp4l` between the two ports | pass; `ptp4l` locks with offsets under 10µs |
+| `robust.sh` | MAC address change, `devlink dev reload`, PCI function-level reset and recovery, loading `mlx5_ib` | pass |
 | `ksft.sh` | `tools/testing/selftests/drivers/net`: `ping`, `queues`, `stats`, `napi_id`, `napi_threaded`, `hw/csum`, `hw/irq`, `hw/xsk_reconfig`, `hw/rss_api`, `hw/rss_ctx`, `hw/rss_input_xfrm`, `hw/tso`, `hw/nic_timestamp` | 64 cases pass, 0 fail, 24 skip |
 
 The skipped kernel selftest cases need things the 6.18 mlx5 driver itself

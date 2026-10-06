@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Broyojo <dha@xoba.com>
 Date: Tue, 6 Oct 2026 15:29:42 -0400
-Subject: [PATCH 2/3] hw/net/mlx5: evaluate flow steering, model flow control,
+Subject: [PATCH 2/4] hw/net/mlx5: evaluate flow steering, model flow control,
  stamp at the MAC
 
 Receive flow steering: keep the flow tables, groups and entries the

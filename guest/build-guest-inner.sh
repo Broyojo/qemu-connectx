@@ -16,7 +16,7 @@ apk add --no-cache --root "$root" --initdb \
 "$root/bin/busybox" --install -s "$root/bin" 2>/dev/null || true
 
 # Modules: mlx5_core, its dependency closure, and a few test helpers.
-mods="mlx5_core af_packet veth ptp 8021q virtio_net virtio_pci"
+mods="mlx5_core mlx5_ib af_packet veth ptp 8021q virtio_net virtio_pci"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null |
         sed -n 's/^insmod \([^ ]*\).*/\1/p'
