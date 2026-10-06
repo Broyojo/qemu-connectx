@@ -11,9 +11,9 @@ apt-get install -y -qq gcc make libc6-dev linux-libc-dev git ca-certificates \
     clang-19 libbpf-dev libelf-dev zlib1g-dev libzstd-dev libmnl-dev \
     pkg-config bison flex >/dev/null 2>&1
 
-# out/tools/bin goes on the guest's PATH; out/tools/ksft mirrors the kernel's
+# tools/bin goes on the guest's PATH; tools/ksft mirrors the kernel's
 # selftests directory for helpers the Python tests look up by location.
-out=/guest/out/tools
+out=$OUT/tools
 rm -rf "$out"
 mkdir -p "$out/bin" "$out/ksft/net/lib" "$out/ksft/drivers/net"
 

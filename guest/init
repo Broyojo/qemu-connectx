@@ -25,4 +25,6 @@ if [ -x /test/run.sh ]; then
     echo "TEST-EXIT: $?"
     grep -qw keepalive /proc/cmdline || poweroff -f
 fi
-exec setsid sh -c 'exec sh </dev/ttyAMA0 >/dev/ttyAMA0 2>&1'
+# Interactive shell on whichever serial console the kernel was given.
+con=$(sed -n 's/.*console=\([a-zA-Z0-9]*\).*/\1/p' /proc/cmdline)
+exec setsid sh -c "exec sh </dev/${con:-console} >/dev/${con:-console} 2>&1"

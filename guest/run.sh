@@ -8,7 +8,9 @@
 # script the guest drops to a shell on the serial console.
 #
 # Environment:
-#   QEMU      qemu-system-aarch64 binary (default: ../qemu/build)
+#   ARCH      guest architecture, aarch64 or x86_64 (default: the host's);
+#             a foreign architecture runs under TCG emulation
+#   QEMU      qemu-system-<arch> binary (default: ../qemu/build)
 #   NICS      "-netdev/-device" arguments (default: one mlx5 on user net)
 #   SMP       number of guest CPUs (default 2)
 #   APPEND    extra kernel command line
@@ -19,8 +21,28 @@
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-qemu=${QEMU:-$here/../qemu/build/qemu-system-aarch64}
-out=$here/out
+
+case $(uname -m) in
+arm64 | aarch64) host=aarch64 ;;
+*) host=x86_64 ;;
+esac
+case ${ARCH:-$host} in
+arm64 | aarch64) arch=aarch64 machine=virt,gic-version=3 console=ttyAMA0 ;;
+x86_64 | amd64) arch=x86_64 machine=q35 console=ttyS0 ;;
+*) echo "unsupported ARCH" >&2; exit 1 ;;
+esac
+# Hardware virtualisation when the guest matches the host, else emulation.
+accel=tcg cpu=max
+if [ "$arch" = "$host" ]; then
+    if [ "$(uname -s)" = Darwin ]; then
+        accel=hvf cpu=host
+    elif [ -w /dev/kvm ]; then
+        accel=kvm cpu=host
+    fi
+fi
+
+qemu=${QEMU:-$here/../qemu/build/qemu-system-$arch}
+out=$here/out/$arch
 script=${1:-}
 [ $# -gt 0 ] && shift
 
@@ -48,10 +70,10 @@ for t in $(echo "${TRACE:-}" | tr ',' ' '); do
 done
 
 # shellcheck disable=SC2086
-"$qemu" -M virt,gic-version=3 -accel "${ACCEL:-hvf}" -cpu "${CPU:-host}" \
+"$qemu" -M "$machine" -accel "${ACCEL:-$accel}" -cpu "${CPU:-$cpu}" \
     -smp "${SMP:-2}" -m "${MEM:-2G}" -nographic -no-reboot \
     -kernel "$out/vmlinuz" -initrd "$ovl/initramfs" \
-    -append "console=ttyAMA0 loglevel=${LOGLEVEL:-4} ${APPEND:-}" \
+    -append "console=$console loglevel=${LOGLEVEL:-4} ${APPEND:-}" \
     -d unimp,guest_errors -D "${QLOG:-$out/qemu.log}" $trace $nics "$@" &
 pid=$!
 

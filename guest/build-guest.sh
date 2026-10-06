@@ -2,14 +2,23 @@
 # Build the test guest: an Alpine linux-lts kernel plus an initramfs that
 # carries mlx5_core, networking/PTP tools and the kernel's own NIC selftests.
 #
-# Runs the real work inside an arm64 Alpine container so it works from macOS.
-# Outputs: guest/out/vmlinuz, guest/out/initramfs-base.cpio.gz
+# Runs the real work inside Linux containers so it works from macOS.
+# Outputs: guest/out/<arch>/vmlinuz, guest/out/<arch>/initramfs-base.cpio.gz
+#
+# Environment:
+#   ARCH   guest architecture, aarch64 or x86_64 (default: the host's)
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 linux=${LINUX_SRC:-$here/../ref/linux}
 linux_tag=${LINUX_TAG:-v6.18.55}
-mkdir -p "$here/out"
+
+case ${ARCH:-$(uname -m)} in
+arm64 | aarch64) arch=aarch64 platform=linux/arm64 ;;
+x86_64 | amd64) arch=x86_64 platform=linux/amd64 ;;
+*) echo "unsupported ARCH" >&2; exit 1 ;;
+esac
+mkdir -p "$here/out/$arch"
 
 # A sparse checkout of the kernel tree: selftests, the netlink library they
 # use, and (for reference while developing the device) the mlx5 driver.
@@ -24,9 +33,9 @@ git -C "$linux" sparse-checkout set \
     tools/testing/selftests/drivers/net
 
 # Test tools first (static binaries in out/tools), then the root filesystem.
-docker run --rm --platform linux/arm64 \
+docker run --rm --platform "$platform" -e "OUT=/guest/out/$arch" \
     -v "$here:/guest" -v "$linux:/linux:ro" \
     debian:sid-slim sh -eu /guest/build-tools-inner.sh
-docker run --rm --platform linux/arm64 \
+docker run --rm --platform "$platform" -e "OUT=/guest/out/$arch" \
     -v "$here:/guest" -v "$linux:/linux:ro" \
     alpine:3.24 sh -eu /guest/build-guest-inner.sh

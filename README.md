@@ -25,10 +25,10 @@ fetches that release, applies `patches/` and builds it.
 
 ## Status
 
-Tested with QEMU 11.1.2 on an Apple Silicon host (HVF) running an aarch64
-Linux 6.18 guest. The device model itself is architecture independent, but
-x86 guests, other kernel versions and other operating systems have not been
-tried yet.
+Tested with QEMU 11.1.2 and Linux 6.18 guests: aarch64 (`virt` machine,
+HVF on an Apple Silicon host) and x86-64 (`q35` machine, TCG emulation on the
+same host). Other kernel versions, other guest operating systems and KVM
+hosts have not been tried yet.
 
 What works:
 
@@ -114,12 +114,16 @@ registers the model does not implement.
 
 `guest/` holds a self-contained test setup: an Alpine `linux-lts` kernel and a
 small initramfs with `mlx5_core`, ethtool, iperf3, linuxptp and the Linux
-kernel's own NIC selftests. Building it needs Docker (it runs arm64
-containers) and takes a few minutes:
+kernel's own NIC selftests. Building it needs Docker and takes a few minutes:
 
 ```
 guest/build-guest.sh
 ```
+
+Both scripts default to the host's architecture. Set `ARCH=x86_64` or
+`ARCH=aarch64` for the other one; `run.sh` then needs the matching
+`qemu-system-<arch>` (see `TARGETS` above) and uses TCG instead of hardware
+virtualisation.
 
 `guest/run.sh <script>` boots the guest, runs the script after the driver has
 loaded and powers off. Without a script it leaves a shell on the serial
@@ -144,6 +148,8 @@ SMP=8 guest/run.sh guest/tests/ksft.sh    # the kernel's driver selftests
 | `ptp.sh` | kernel `testptp` and `hwtstamp_config`, linuxptp `phc_ctl`/`hwstamp_ctl`, `ptp4l` between the two ports | pass; `ptp4l` locks with offsets under 10µs |
 | `robust.sh` | MAC address change, `devlink dev reload`, PCI function-level reset and recovery, loading `mlx5_ib` | pass |
 | `ksft.sh` | `tools/testing/selftests/drivers/net`: `ping`, `queues`, `stats`, `napi_id`, `napi_threaded`, `hw/csum`, `hw/irq`, `hw/xsk_reconfig`, `hw/rss_api`, `hw/rss_ctx`, `hw/rss_input_xfrm`, `hw/tso`, `hw/nic_timestamp` | 64 cases pass, 0 fail, 24 skip |
+
+These results are the same for the aarch64 and the x86-64 guest.
 
 The skipped kernel selftest cases need things the 6.18 mlx5 driver itself
 does not offer (per-queue LSO statistics, timestamp configuration over

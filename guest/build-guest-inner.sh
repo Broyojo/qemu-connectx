@@ -31,7 +31,7 @@ depmod -b "$root" "$kver"
 # Test tools built by build-tools-inner.sh.
 # /usr/local/bin is first on the guest's PATH: our "ip" shadows Alpine's.
 mkdir -p "$root/usr/local/bin"
-cp /guest/out/tools/bin/* "$root/usr/local/bin/"
+cp "$OUT"/tools/bin/* "$root/usr/local/bin/"
 
 # The kernel's Python driver tests, with the tree layout they expect (they
 # find the netlink library and specs relative to their own location).
@@ -44,15 +44,15 @@ cp -r "$st/net/lib" "$ksft/tools/testing/selftests/net/"
 cp -r "$st/drivers/net" "$ksft/tools/testing/selftests/drivers/"
 cp -r /linux/tools/net/ynl "$ksft/tools/net/"
 cp -r /linux/Documentation/netlink "$ksft/Documentation/"
-cp -r /guest/out/tools/ksft/* "$ksft/tools/testing/selftests/"
+cp -r "$OUT"/tools/ksft/* "$ksft/tools/testing/selftests/"
 
 cp /guest/init "$root/init"
 chmod +x "$root/init"
 mkdir -p "$root/proc" "$root/sys" "$root/dev" "$root/tmp" "$root/run" "$root/test"
 
 (cd "$root" && find . | cpio -o -H newc 2>/dev/null | gzip -1) \
-    > /guest/out/initramfs-base.cpio.gz
-cp /boot/vmlinuz-lts /guest/out/vmlinuz
-echo "$kver" > /guest/out/kver
-ls -la /guest/out
+    > "$OUT/initramfs-base.cpio.gz"
+cp /boot/vmlinuz-lts "$OUT/vmlinuz"
+echo "$kver" > "$OUT/kver"
+ls -la "$OUT"
 echo "modules:"; find "$root/lib/modules" -name '*.ko*' | sed 's|.*/||' | tr '\n' ' '; echo
